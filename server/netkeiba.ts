@@ -43,6 +43,7 @@ export type RaceCard = {
   course: string
   distance: number
   surface: 'turf' | 'dirt' | 'unknown'
+  trackCondition: string
   horses: RaceCardHorse[]
 }
 
@@ -59,6 +60,8 @@ export async function fetchRaceCard(raceId: string): Promise<RaceCard> {
     : raceData01.includes('芝')
       ? 'turf'
       : 'unknown'
+  const conditionMatch = raceData01.match(/馬場:(\S+)/)
+  const trackCondition = conditionMatch ? conditionMatch[1] : ''
 
   const horses: RaceCardHorse[] = []
   $('tr.HorseList').each((_, el) => {
@@ -97,7 +100,7 @@ export async function fetchRaceCard(raceId: string): Promise<RaceCard> {
     })
   })
 
-  return { raceId, raceName, course: raceData01, distance, surface, horses }
+  return { raceId, raceName, course: raceData01, distance, surface, trackCondition, horses }
 }
 
 export type PastRace = {
@@ -113,6 +116,7 @@ export type PastRace = {
   jockey: string
   time: string
   agari: string // 上り(上がり3F)
+  passingPositions: string // 通過順位 (例: "12-12-11-10")
 }
 
 export async function fetchHorseHistory(horseId: string): Promise<PastRace[]> {
@@ -143,6 +147,7 @@ export async function fetchHorseHistory(horseId: string): Promise<PastRace[]> {
     const popularityText = get(10)
     const jockey = get(12)
     const time = get(18)
+    const passingPositions = get(25)
     const agari = get(27)
 
     races.push({
@@ -158,40 +163,83 @@ export async function fetchHorseHistory(horseId: string): Promise<PastRace[]> {
       jockey,
       time,
       agari,
+      passingPositions,
     })
   })
 
   return races
 }
 
+// 血統表は3世代(父母・祖父母・曾祖父母)まで保持する
 export type Pedigree = {
   sire: string // 父
+  dam: string // 母
   sireSire: string // 父父
   sireDam: string // 父母
-  dam: string // 母
   damSire: string // 母父(damsire)
   damDam: string // 母母
+  sireSireSire: string // 父父父
+  sireSireDam: string // 父父母
+  sireDamSire: string // 父母父
+  sireDamDam: string // 父母母
+  damSireSire: string // 母父父
+  damSireDam: string // 母父母
+  damDamSire: string // 母母父
+  damDamDam: string // 母母母
+}
+
+// netkeibaの血統表はHTMLの<td rowspan>で世代を表現しているため、
+// rowspanを展開して32行×5世代のグリッドに復元してから読み取る
+function expandPedigreeGrid($: cheerio.CheerioAPI, table: cheerio.Cheerio<any>): string[][] {
+  const COLS = 5
+  const rows = table.find('tr')
+  const grid: string[][] = []
+  const pending: ({ value: string; endRow: number } | null)[] = Array(COLS).fill(null)
+
+  rows.each((r, tr) => {
+    grid.push(Array(COLS).fill(''))
+    const tds = $(tr).find('td')
+    let tdIdx = 0
+    for (let c = 0; c < COLS; c++) {
+      const carry = pending[c]
+      if (carry && carry.endRow > r) {
+        grid[r][c] = carry.value
+        continue
+      }
+      const td = tds[tdIdx++]
+      if (!td) continue
+      const rowspan = parseInt($(td).attr('rowspan') || '1', 10)
+      const name = $(td).find('a').first().text().trim().split('\n')[0].trim()
+      grid[r][c] = name
+      pending[c] = { value: name, endRow: r + rowspan }
+    }
+  })
+
+  return grid
 }
 
 export async function fetchPedigree(horseId: string): Promise<Pedigree> {
-  const res = await axios.get('https://db.netkeiba.com/horse/ajax_horse_pedigree.html', {
-    params: { input: 'UTF-8', output: 'json', id: horseId },
-    headers: { 'User-Agent': UA },
-    timeout: 15000,
-  })
-  const html: string = res.data?.data || ''
+  const html = await fetchHtml(`https://db.netkeiba.com/horse/ped/${horseId}/`)
   const $ = cheerio.load(html)
-  const names = $('table.blood_table td')
-    .map((_, td) => $(td).text().trim())
-    .get()
+  const table = $('table.blood_table').first()
+  const grid = expandPedigreeGrid($, table)
+  const at = (r: number, c: number) => grid[r]?.[c] || ''
 
   return {
-    sire: names[0] || '',
-    sireSire: names[1] || '',
-    sireDam: names[2] || '',
-    dam: names[3] || '',
-    damSire: names[4] || '',
-    damDam: names[5] || '',
+    sire: at(0, 0),
+    dam: at(16, 0),
+    sireSire: at(0, 1),
+    sireDam: at(8, 1),
+    damSire: at(16, 1),
+    damDam: at(24, 1),
+    sireSireSire: at(0, 2),
+    sireSireDam: at(4, 2),
+    sireDamSire: at(8, 2),
+    sireDamDam: at(12, 2),
+    damSireSire: at(16, 2),
+    damSireDam: at(20, 2),
+    damDamSire: at(24, 2),
+    damDamDam: at(28, 2),
   }
 }
 

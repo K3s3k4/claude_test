@@ -4,6 +4,9 @@ type PredictionBreakdown = {
   recentForm: number
   distanceAptitude: number
   surfaceAptitude: number
+  trackConditionAptitude: number
+  classAdequacy: number
+  jockeyContinuity: number
   condition: number
   pedigree: number
   market: number
@@ -26,16 +29,27 @@ type RaceCardHorse = {
 
 type Pedigree = {
   sire: string
+  dam: string
   sireSire: string
   sireDam: string
-  dam: string
   damSire: string
   damDam: string
+  sireSireSire: string
+  sireSireDam: string
+  sireDamSire: string
+  sireDamDam: string
+  damSireSire: string
+  damSireDam: string
+  damDamSire: string
+  damDamDam: string
 }
+
+type RunningStyle = '逃げ' | '先行' | '差し' | '追込' | '不明'
 
 type HorsePrediction = {
   horse: RaceCardHorse
   pedigree: Pedigree
+  runningStyle: RunningStyle
   score: number
   breakdown: PredictionBreakdown
   rank: number
@@ -47,6 +61,7 @@ type RaceCard = {
   course: string
   distance: number
   surface: 'turf' | 'dirt' | 'unknown'
+  trackCondition: string
   horses: RaceCardHorse[]
 }
 
@@ -59,6 +74,9 @@ const BREAKDOWN_LABELS: Record<keyof PredictionBreakdown, string> = {
   recentForm: '近走成績',
   distanceAptitude: '距離適性',
   surfaceAptitude: '馬場適性',
+  trackConditionAptitude: '馬場状態適性',
+  classAdequacy: 'クラス適性',
+  jockeyContinuity: '騎手相性',
   condition: 'コンディション',
   pedigree: '血統',
   market: '市場評価',
@@ -170,6 +188,7 @@ function Prediction() {
                   <th>馬名</th>
                   <th>性齢</th>
                   <th>騎手</th>
+                  <th>脚質</th>
                   <th>父</th>
                   <th>人気</th>
                   <th>スコア</th>
@@ -187,6 +206,9 @@ function Prediction() {
                       <td className="fw-semibold">{p.horse.name}</td>
                       <td>{p.horse.sexAge}</td>
                       <td>{p.horse.jockey}</td>
+                      <td>
+                        <span className="badge bg-info-subtle text-info-emphasis">{p.runningStyle}</span>
+                      </td>
                       <td>{p.pedigree.sire}</td>
                       <td>{p.horse.popularity ?? '-'}</td>
                       <td className="fw-bold">{p.score}</td>
@@ -202,7 +224,7 @@ function Prediction() {
                     </tr>
                     {expanded === p.horse.horseId && (
                       <tr>
-                        <td colSpan={9} className="bg-light">
+                        <td colSpan={10} className="bg-light">
                           <div className="row g-3 py-2">
                             <div className="col-md-6">
                               <div className="fw-semibold small mb-2">スコア内訳</div>
@@ -224,16 +246,82 @@ function Prediction() {
                               ))}
                             </div>
                             <div className="col-md-6">
-                              <div className="fw-semibold small mb-2">血統</div>
+                              <div className="fw-semibold small mb-2">血統（曾祖父母まで）</div>
+                              <table className="table table-sm table-borderless mb-2 small">
+                                <tbody>
+                                  <tr>
+                                    <td className="text-muted" style={{ width: 50 }}>
+                                      父
+                                    </td>
+                                    <td colSpan={2}>{p.pedigree.sire || '不明'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">父父</td>
+                                    <td>{p.pedigree.sireSire || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　├父父父</td>
+                                    <td className="text-muted">{p.pedigree.sireSireSire || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　└父父母</td>
+                                    <td className="text-muted">{p.pedigree.sireSireDam || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">父母</td>
+                                    <td>{p.pedigree.sireDam || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　├父母父</td>
+                                    <td className="text-muted">{p.pedigree.sireDamSire || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　└父母母</td>
+                                    <td className="text-muted">{p.pedigree.sireDamDam || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td className="text-muted">母</td>
+                                    <td colSpan={2}>{p.pedigree.dam || '不明'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">母父</td>
+                                    <td>{p.pedigree.damSire || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　├母父父</td>
+                                    <td className="text-muted">{p.pedigree.damSireSire || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　└母父母</td>
+                                    <td className="text-muted">{p.pedigree.damSireDam || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">母母</td>
+                                    <td>{p.pedigree.damDam || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　├母母父</td>
+                                    <td className="text-muted">{p.pedigree.damDamSire || '-'}</td>
+                                  </tr>
+                                  <tr>
+                                    <td />
+                                    <td className="text-muted">　└母母母</td>
+                                    <td className="text-muted">{p.pedigree.damDamDam || '-'}</td>
+                                  </tr>
+                                </tbody>
+                              </table>
                               <div className="small text-muted">
-                                父: {p.pedigree.sire || '不明'} / 父父: {p.pedigree.sireSire || '-'} / 父母:{' '}
-                                {p.pedigree.sireDam || '-'}
-                              </div>
-                              <div className="small text-muted">
-                                母: {p.pedigree.dam || '不明'} / 母父: {p.pedigree.damSire || '-'} / 母母:{' '}
-                                {p.pedigree.damDam || '-'}
-                              </div>
-                              <div className="small text-muted mt-2">
                                 馬体重: {p.horse.horseWeight ?? '-'}kg (
                                 {p.horse.horseWeightDiff != null && p.horse.horseWeightDiff >= 0 ? '+' : ''}
                                 {p.horse.horseWeightDiff ?? '-'})

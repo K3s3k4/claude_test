@@ -1,6 +1,6 @@
 import type { RaceCard, RaceCardHorse, PastRace, Pedigree } from './netkeiba'
 
-// 実績のある種牡馬・母父を簡易的にランク付け（0-100）。リストにない場合は中立点。
+// 実績のある種牡馬・母父を簡易的にランク付け(0-100)。リストにない場合は中立点(50)。
 // 本格的な血統統計DBの代替として、著名な種牡馬を手動でスコアリングしている簡易版。
 const SIRE_RATING: Record<string, number> = {
   ディープインパクト: 95,
@@ -19,10 +19,47 @@ const SIRE_RATING: Record<string, number> = {
   マンハッタンカフェ: 75,
   ステイゴールド: 83,
   シンボリクリスエス: 78,
+  トニービン: 80,
+  ノーザンテースト: 78,
+  ミスタープロスペクター: 82,
+  ノーザンダンサー: 90,
+  'Hail to Reason': 65,
+  'Nijinsky': 75,
 }
 
 function ratePedigreeName(name: string): number {
   return SIRE_RATING[name] ?? 50
+}
+
+// 3世代分の血統を、直系に近いほど重みを大きくして加重平均する
+const PEDIGREE_WEIGHTS: [keyof Pedigree, number][] = [
+  ['sire', 3],
+  ['dam', 1.2],
+  ['sireSire', 1.5],
+  ['damSire', 1.8], // 母父(damsire)は日本の血統理論で特に重視される
+  ['sireDam', 0.8],
+  ['damDam', 0.8],
+  ['sireSireSire', 0.5],
+  ['sireSireDam', 0.3],
+  ['sireDamSire', 0.5],
+  ['sireDamDam', 0.3],
+  ['damSireSire', 0.5],
+  ['damSireDam', 0.3],
+  ['damDamSire', 0.5],
+  ['damDamDam', 0.3],
+]
+
+function pedigreeScore(pedigree: Pedigree): number {
+  let sum = 0
+  let weightSum = 0
+  for (const [key, weight] of PEDIGREE_WEIGHTS) {
+    const name = pedigree[key]
+    if (!name) continue
+    sum += ratePedigreeName(name) * weight
+    weightSum += weight
+  }
+  if (weightSum === 0) return 50
+  return sum / weightSum
 }
 
 function finishScore(pos: number | null, fieldSize: number | null): number {
@@ -67,6 +104,16 @@ function surfaceAptitudeScore(history: PastRace[], targetSurface: RaceCard['surf
   return avg
 }
 
+// 馬場状態(良/稍重/重/不良)ごとの適性
+function trackConditionAptitudeScore(history: PastRace[], targetCondition: string): number {
+  if (!targetCondition) return 50
+  const matches = history.filter((r) => r.trackCondition === targetCondition)
+  if (matches.length === 0) return recentFormScore(history) * 0.85
+  const avg =
+    matches.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) / matches.length
+  return avg
+}
+
 function conditionScore(horse: RaceCardHorse): number {
   const diff = horse.horseWeightDiff ?? 0
   const abs = Math.abs(diff)
@@ -76,21 +123,89 @@ function conditionScore(horse: RaceCardHorse): number {
   return 25
 }
 
-function pedigreeScore(pedigree: Pedigree): number {
-  const sireScore = ratePedigreeName(pedigree.sire)
-  const damSireScore = ratePedigreeName(pedigree.damSire)
-  return sireScore * 0.7 + damSireScore * 0.3
-}
-
 function marketScore(horse: RaceCardHorse): number {
   if (!horse.popularity) return 50
   return Math.max(20, 100 - (horse.popularity - 1) * 8)
+}
+
+// レース名から級別(クラス)を推定する。数字が大きいほど格上のレース。
+const CLASS_PATTERNS: [RegExp, number][] = [
+  [/\(GIII\)|\(G3\)/, 6],
+  [/\(GII\)|\(G2\)/, 7],
+  [/\(GI\)|\(G1\)/, 8],
+  [/\(L\)/, 5],
+  [/オープン|\bOP\b/, 5],
+  [/3勝クラス|1600万下/, 4],
+  [/2勝クラス|1000万下/, 3],
+  [/1勝クラス|500万下/, 2],
+  [/未勝利|新馬/, 1],
+]
+
+function raceClassRank(raceName: string): number {
+  for (const [pattern, rank] of CLASS_PATTERNS) {
+    if (pattern.test(raceName)) return rank
+  }
+  return 0 // 不明
+}
+
+// 今回のレースの格に対して、過去にどのレベルまで実績があるかを評価する
+function classAdequacyScore(history: PastRace[], currentRaceName: string): number {
+  const targetRank = raceClassRank(currentRaceName)
+  if (targetRank === 0) return 50
+
+  let highestRankRun = 0
+  let highestRankPlaced = 0
+  for (const race of history) {
+    const rank = raceClassRank(race.raceName)
+    if (rank === 0) continue
+    if (rank > highestRankRun) highestRankRun = rank
+    if (rank > highestRankPlaced && race.finishPosition != null && race.finishPosition <= 3) {
+      highestRankPlaced = rank
+    }
+  }
+
+  if (highestRankPlaced >= targetRank) return 90
+  if (highestRankRun >= targetRank) return 65
+  if (highestRankRun === targetRank - 1) return 55
+  return 35
+}
+
+// 同じ騎手が継続して騎乗しているか、その騎手との相性
+function jockeyContinuityScore(history: PastRace[], currentJockey: string): number {
+  if (!currentJockey) return 50
+  const matches = history.filter((r) => r.jockey === currentJockey)
+  if (matches.length === 0) return 50
+  const avg = matches.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) / matches.length
+  const continuityBonus = history[0]?.jockey === currentJockey ? 5 : 0
+  return Math.min(100, avg + continuityBonus)
+}
+
+export type RunningStyle = '逃げ' | '先行' | '差し' | '追込' | '不明'
+
+// 通過順位(コーナー通過順)から脚質を推定する。あくまで参考情報でスコアには含めない。
+export function estimateRunningStyle(history: PastRace[]): RunningStyle {
+  const ratios: number[] = []
+  for (const race of history.slice(0, 5)) {
+    if (!race.passingPositions || !race.fieldSize) continue
+    const first = Number(race.passingPositions.split('-')[0])
+    if (!first || !race.fieldSize) continue
+    ratios.push(first / race.fieldSize)
+  }
+  if (ratios.length === 0) return '不明'
+  const avg = ratios.reduce((s, r) => s + r, 0) / ratios.length
+  if (avg <= 0.25) return '逃げ'
+  if (avg <= 0.5) return '先行'
+  if (avg <= 0.75) return '差し'
+  return '追込'
 }
 
 export type PredictionBreakdown = {
   recentForm: number
   distanceAptitude: number
   surfaceAptitude: number
+  trackConditionAptitude: number
+  classAdequacy: number
+  jockeyContinuity: number
   condition: number
   pedigree: number
   market: number
@@ -99,17 +214,21 @@ export type PredictionBreakdown = {
 export type HorsePrediction = {
   horse: RaceCardHorse
   pedigree: Pedigree
+  runningStyle: RunningStyle
   score: number
   breakdown: PredictionBreakdown
   rank: number
 }
 
-const WEIGHTS = {
-  recentForm: 0.3,
-  distanceAptitude: 0.2,
-  surfaceAptitude: 0.15,
-  condition: 0.1,
-  pedigree: 0.15,
+const WEIGHTS: Record<keyof PredictionBreakdown, number> = {
+  recentForm: 0.2,
+  distanceAptitude: 0.13,
+  surfaceAptitude: 0.08,
+  trackConditionAptitude: 0.07,
+  classAdequacy: 0.12,
+  jockeyContinuity: 0.05,
+  condition: 0.08,
+  pedigree: 0.17,
   market: 0.1,
 }
 
@@ -123,20 +242,26 @@ export function scoreHorse(
     recentForm: recentFormScore(history),
     distanceAptitude: distanceAptitudeScore(history, race.distance),
     surfaceAptitude: surfaceAptitudeScore(history, race.surface),
+    trackConditionAptitude: trackConditionAptitudeScore(history, race.trackCondition),
+    classAdequacy: classAdequacyScore(history, race.raceName),
+    jockeyContinuity: jockeyContinuityScore(history, horse.jockey),
     condition: conditionScore(horse),
     pedigree: pedigreeScore(pedigree),
     market: marketScore(horse),
   }
 
-  const score =
-    breakdown.recentForm * WEIGHTS.recentForm +
-    breakdown.distanceAptitude * WEIGHTS.distanceAptitude +
-    breakdown.surfaceAptitude * WEIGHTS.surfaceAptitude +
-    breakdown.condition * WEIGHTS.condition +
-    breakdown.pedigree * WEIGHTS.pedigree +
-    breakdown.market * WEIGHTS.market
+  const score = (Object.keys(WEIGHTS) as (keyof PredictionBreakdown)[]).reduce(
+    (s, key) => s + breakdown[key] * WEIGHTS[key],
+    0,
+  )
 
-  return { horse, pedigree, score: Math.round(score * 10) / 10, breakdown }
+  return {
+    horse,
+    pedigree,
+    runningStyle: estimateRunningStyle(history),
+    score: Math.round(score * 10) / 10,
+    breakdown,
+  }
 }
 
 export function rankPredictions(predictions: Omit<HorsePrediction, 'rank'>[]): HorsePrediction[] {
