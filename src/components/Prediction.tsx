@@ -53,6 +53,9 @@ type HorsePrediction = {
   score: number
   breakdown: PredictionBreakdown
   rank: number
+  winProbability: number
+  placeProbability: number
+  winEv: number | null
 }
 
 type RaceCard = {
@@ -66,18 +69,19 @@ type RaceCard = {
 }
 
 type Pick = { umaban: number; name: string }
+type Combo = { picks: Pick[]; probability: number }
 
 type BetSuggestions = {
   confidence: '堅い' | 'やや堅い' | '混戦'
-  scoreGap: number
+  probabilityGap: number
   boxSize: number
-  tansho: Pick[]
-  fukusho: Pick[]
-  umaren: [Pick, Pick][]
-  wide: [Pick, Pick][]
-  umatan: [Pick, Pick][]
-  sanrenpuku: [Pick, Pick, Pick][]
-  sanrentan: [Pick, Pick, Pick][]
+  tansho: { pick: Pick; winProbability: number; odds: number | null; ev: number | null }[]
+  fukusho: { pick: Pick; placeProbability: number }[]
+  umaren: Combo[]
+  wide: Combo[]
+  umatan: Combo[]
+  sanrenpuku: Combo[]
+  sanrentan: Combo[]
 }
 
 type ApiResponse = {
@@ -126,15 +130,11 @@ function PickBadge({ pick }: { pick: Pick }) {
   )
 }
 
-function CombosRow({
-  label,
-  combos,
-  ordered = false,
-}: {
-  label: string
-  combos: Pick[][]
-  ordered?: boolean
-}) {
+function formatPct(p: number) {
+  return `${(p * 100).toFixed(1)}%`
+}
+
+function CombosRow({ label, combos, ordered = false }: { label: string; combos: Combo[]; ordered?: boolean }) {
   if (combos.length === 0) return null
   const separator = ordered ? '→' : '-'
   return (
@@ -145,8 +145,9 @@ function CombosRow({
       </div>
       <div className="d-flex flex-wrap gap-1">
         {combos.map((combo, i) => (
-          <span key={i} className="badge bg-light text-dark border fw-normal">
-            {combo.map((p) => `${p.umaban}`).join(separator)}
+          <span key={i} className="badge bg-light text-dark border fw-normal" title={`推定的中確率 ${formatPct(combo.probability)}`}>
+            {combo.picks.map((p) => `${p.umaban}`).join(separator)}
+            <span className="text-muted ms-1">{formatPct(combo.probability)}</span>
           </span>
         ))}
       </div>
@@ -161,21 +162,34 @@ function BetSuggestionsCard({ bets }: { bets: BetSuggestions }) {
         <div className="d-flex align-items-center gap-2 mb-3">
           <h2 className="h6 fw-bold mb-0">推奨買い目</h2>
           <span className={`badge ${confidenceBadgeClass(bets.confidence)}`}>{bets.confidence}</span>
-          <span className="text-muted small">1位-2位スコア差: {bets.scoreGap}</span>
+          <span className="text-muted small">1位-2位推定勝率差: {bets.probabilityGap}pt</span>
         </div>
 
         <div className="row g-3">
           <div className="col-md-6">
             <div className="mb-2">
               <div className="text-muted small mb-1">単勝</div>
-              {bets.tansho.map((p) => (
-                <PickBadge key={p.umaban} pick={p} />
+              {bets.tansho.map((t) => (
+                <div key={t.pick.umaban} className="d-flex align-items-center gap-2">
+                  <PickBadge pick={t.pick} />
+                  <span className="text-muted small">推定勝率 {formatPct(t.winProbability)}</span>
+                  {t.odds != null ? (
+                    <span className={`small ${t.ev != null && t.ev >= 1 ? 'text-success fw-semibold' : 'text-muted'}`}>
+                      オッズ{t.odds}倍 / EV {t.ev}
+                    </span>
+                  ) : (
+                    <span className="text-muted small">オッズ未確定</span>
+                  )}
+                </div>
               ))}
             </div>
             <div className="mb-2">
               <div className="text-muted small mb-1">複勝</div>
-              {bets.fukusho.map((p) => (
-                <PickBadge key={p.umaban} pick={p} />
+              {bets.fukusho.map((f) => (
+                <div key={f.pick.umaban} className="d-flex align-items-center gap-2">
+                  <PickBadge pick={f.pick} />
+                  <span className="text-muted small">推定複勝率 {formatPct(f.placeProbability)}</span>
+                </div>
               ))}
             </div>
             <CombosRow label="馬連" combos={bets.umaren} />
@@ -189,7 +203,7 @@ function BetSuggestionsCard({ bets }: { bets: BetSuggestions }) {
         </div>
         <p className="text-muted small mb-0 mt-2">
           <i className="bi bi-info-circle me-1" />
-          スコア上位{bets.boxSize}頭を基準に自動生成した参考買い目です。馬単・三連単は1位を軸に固定しています。
+          推定勝率上位{bets.boxSize}頭を基準に、Harvilleモデルで算出した的中確率順に表示しています。馬単・三連単は1位を軸に固定。EVは推定勝率×オッズ(1超で理論上プラス期待値)。オッズ・確率は未検証のモデルによる参考値です。
         </p>
       </div>
     </div>
@@ -294,6 +308,7 @@ function Prediction() {
                   <th>父</th>
                   <th>人気</th>
                   <th>スコア</th>
+                  <th>推定勝率</th>
                   <th />
                 </tr>
               </thead>
@@ -314,6 +329,7 @@ function Prediction() {
                       <td>{p.pedigree.sire}</td>
                       <td>{p.horse.popularity ?? '-'}</td>
                       <td className="fw-bold">{p.score}</td>
+                      <td>{formatPct(p.winProbability)}</td>
                       <td>
                         <button
                           type="button"
@@ -326,7 +342,7 @@ function Prediction() {
                     </tr>
                     {expanded === p.horse.horseId && (
                       <tr>
-                        <td colSpan={10} className="bg-light">
+                        <td colSpan={11} className="bg-light">
                           <div className="row g-3 py-2">
                             <div className="col-md-6">
                               <div className="fw-semibold small mb-2">スコア内訳</div>

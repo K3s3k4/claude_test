@@ -1,4 +1,15 @@
 import type { RaceCard, RaceCardHorse, PastRace, Pedigree } from './netkeiba'
+import {
+  softmaxProbabilities,
+  empiricalBayesShrink,
+  quinellaProbability,
+  wideProbability,
+  exactaProbability,
+  trioSetProbability,
+  trifectaOrderProbability,
+  placeProbability,
+  expectedValue,
+} from './probability'
 
 // 実績のある種牡馬・母父を簡易的にランク付け(0-100)。リストにない場合は中立点(50)。
 // 本格的な血統統計DBの代替として、著名な種牡馬を手動でスコアリングしている簡易版。
@@ -72,9 +83,12 @@ function finishScore(pos: number | null, fieldSize: number | null): number {
   return Math.round(55 * rest)
 }
 
+// 経験ベイズ補正のデフォルト強度。小さいほど少サンプルでも観測値を信じやすい。
+const SHRINK_K = 3
+
 function recentFormScore(history: PastRace[]): number {
   const recent = history.slice(0, 5)
-  if (recent.length === 0) return 45
+  if (recent.length === 0) return 50
   const weights = [1.5, 1.2, 1.0, 0.8, 0.6]
   let sum = 0
   let weightSum = 0
@@ -83,35 +97,39 @@ function recentFormScore(history: PastRace[]): number {
     sum += finishScore(race.finishPosition, race.fieldSize) * w
     weightSum += w
   })
-  return sum / weightSum
+  const rawAvg = sum / weightSum
+  // 出走数が5走に満たない場合は中立点(50)側に補正する
+  return empiricalBayesShrink(rawAvg, recent.length, 50, SHRINK_K)
 }
 
 function distanceAptitudeScore(history: PastRace[], targetDistance: number): number {
   const inRange = history.filter((r) => Math.abs(r.distance - targetDistance) <= 400 && r.distance > 0)
-  if (inRange.length === 0) return recentFormScore(history) * 0.7
-  const avg =
+  const prior = recentFormScore(history)
+  if (inRange.length === 0) return prior
+  const rawAvg =
     inRange.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) / inRange.length
-  return avg
+  return empiricalBayesShrink(rawAvg, inRange.length, prior, SHRINK_K)
 }
 
 function surfaceAptitudeScore(history: PastRace[], targetSurface: RaceCard['surface']): number {
   if (targetSurface === 'unknown') return 50
   const sameSurface = history.filter((r) => r.surface === targetSurface)
   if (sameSurface.length === 0) return 50
-  const avg =
+  const rawAvg =
     sameSurface.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) /
     sameSurface.length
-  return avg
+  return empiricalBayesShrink(rawAvg, sameSurface.length, 50, SHRINK_K)
 }
 
 // 馬場状態(良/稍重/重/不良)ごとの適性
 function trackConditionAptitudeScore(history: PastRace[], targetCondition: string): number {
   if (!targetCondition) return 50
   const matches = history.filter((r) => r.trackCondition === targetCondition)
-  if (matches.length === 0) return recentFormScore(history) * 0.85
-  const avg =
+  const prior = recentFormScore(history)
+  if (matches.length === 0) return prior
+  const rawAvg =
     matches.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) / matches.length
-  return avg
+  return empiricalBayesShrink(rawAvg, matches.length, prior, SHRINK_K)
 }
 
 function conditionScore(horse: RaceCardHorse): number {
@@ -175,9 +193,11 @@ function jockeyContinuityScore(history: PastRace[], currentJockey: string): numb
   if (!currentJockey) return 50
   const matches = history.filter((r) => r.jockey === currentJockey)
   if (matches.length === 0) return 50
-  const avg = matches.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) / matches.length
+  const rawAvg =
+    matches.reduce((s, r) => s + finishScore(r.finishPosition, r.fieldSize), 0) / matches.length
+  const shrunk = empiricalBayesShrink(rawAvg, matches.length, 50, SHRINK_K)
   const continuityBonus = history[0]?.jockey === currentJockey ? 5 : 0
-  return Math.min(100, avg + continuityBonus)
+  return Math.min(100, shrunk + continuityBonus)
 }
 
 export type RunningStyle = '逃げ' | '先行' | '差し' | '追込' | '不明'
@@ -218,6 +238,9 @@ export type HorsePrediction = {
   score: number
   breakdown: PredictionBreakdown
   rank: number
+  winProbability: number // 推定勝率 (0-1、全頭で合計1)
+  placeProbability: number // 推定複勝率 (3着以内に入る確率)
+  winEv: number | null // 単勝の期待値 = winProbability × オッズ (オッズ未確定時はnull)
 }
 
 const WEIGHTS: Record<keyof PredictionBreakdown, number> = {
@@ -232,12 +255,14 @@ const WEIGHTS: Record<keyof PredictionBreakdown, number> = {
   market: 0.1,
 }
 
+type ScoredHorse = Omit<HorsePrediction, 'rank' | 'winProbability' | 'placeProbability' | 'winEv'>
+
 export function scoreHorse(
   race: RaceCard,
   horse: RaceCardHorse,
   history: PastRace[],
   pedigree: Pedigree,
-): Omit<HorsePrediction, 'rank'> {
+): ScoredHorse {
   const breakdown: PredictionBreakdown = {
     recentForm: recentFormScore(history),
     distanceAptitude: distanceAptitudeScore(history, race.distance),
@@ -264,62 +289,91 @@ export function scoreHorse(
   }
 }
 
-export function rankPredictions(predictions: Omit<HorsePrediction, 'rank'>[]): HorsePrediction[] {
-  return [...predictions]
-    .sort((a, b) => b.score - a.score)
-    .map((p, i) => ({ ...p, rank: i + 1 }))
+// softmaxの温度。バックテストによるキャリブレーションは未実施の暫定値。
+const SOFTMAX_TEMPERATURE = 10
+
+export function rankPredictions(predictions: ScoredHorse[]): HorsePrediction[] {
+  const sorted = [...predictions].sort((a, b) => b.score - a.score)
+  const winProbs = softmaxProbabilities(
+    sorted.map((p) => p.score),
+    SOFTMAX_TEMPERATURE,
+  )
+
+  return sorted.map((p, i) => ({
+    ...p,
+    rank: i + 1,
+    winProbability: winProbs[i],
+    placeProbability: placeProbability(i, winProbs),
+    winEv: expectedValue(winProbs[i], p.horse.odds),
+  }))
 }
 
 // --- 買い目推奨 ---
 
 type Pick = { umaban: number; name: string }
+type Combo = { picks: Pick[]; probability: number }
 
 export type BetSuggestions = {
   confidence: '堅い' | 'やや堅い' | '混戦'
-  scoreGap: number // 1位と2位のスコア差
+  probabilityGap: number // 1位と2位の推定勝率の差(%pt)
   boxSize: number // 軸+ヒモとして採用した頭数
-  tansho: Pick[] // 単勝
-  fukusho: Pick[] // 複勝
-  umaren: [Pick, Pick][] // 馬連(BOX)
-  wide: [Pick, Pick][] // ワイド(BOX)
-  umatan: [Pick, Pick][] // 馬単(1着軸流し)
-  sanrenpuku: [Pick, Pick, Pick][] // 三連複(BOX)
-  sanrentan: [Pick, Pick, Pick][] // 三連単(1着軸2-3着流し)
+  tansho: { pick: Pick; winProbability: number; odds: number | null; ev: number | null }[]
+  fukusho: { pick: Pick; placeProbability: number }[]
+  umaren: Combo[] // 馬連(BOX、確率降順)
+  wide: Combo[] // ワイド(BOX、確率降順)
+  umatan: Combo[] // 馬単(1着軸流し、確率降順)
+  sanrenpuku: Combo[] // 三連複(BOX、確率降順)
+  sanrentan: Combo[] // 三連単(1着軸2-3着流し、確率降順)
 }
 
-function combinations<T>(arr: T[], k: number): T[][] {
+function combinationsIdx(n: number, k: number): number[][] {
   if (k === 0) return [[]]
-  if (arr.length < k) return []
-  const [head, ...rest] = arr
-  const withHead = combinations(rest, k - 1).map((c) => [head, ...c])
-  const withoutHead = combinations(rest, k)
-  return [...withHead, ...withoutHead]
+  if (n < k) return []
+  const result: number[][] = []
+  function go(start: number, chosen: number[]) {
+    if (chosen.length === k) {
+      result.push([...chosen])
+      return
+    }
+    for (let i = start; i < n; i++) {
+      chosen.push(i)
+      go(i + 1, chosen)
+      chosen.pop()
+    }
+  }
+  go(0, [])
+  return result
 }
 
-function permutations<T>(arr: T[], k: number): T[][] {
+function permutationsIdx(candidates: number[], k: number): number[][] {
   if (k === 0) return [[]]
-  const result: T[][] = []
-  arr.forEach((item, i) => {
-    const rest = [...arr.slice(0, i), ...arr.slice(i + 1)]
-    for (const p of permutations(rest, k - 1)) {
+  const result: number[][] = []
+  candidates.forEach((item, i) => {
+    const rest = [...candidates.slice(0, i), ...candidates.slice(i + 1)]
+    for (const p of permutationsIdx(rest, k - 1)) {
       result.push([item, ...p])
     }
   })
   return result
 }
 
+function byProbabilityDesc(a: Combo, b: Combo) {
+  return b.probability - a.probability
+}
+
 export function suggestBets(ranked: HorsePrediction[]): BetSuggestions | null {
   if (ranked.length < 3) return null
 
   const toPick = (p: HorsePrediction): Pick => ({ umaban: p.horse.umaban, name: p.horse.name })
-  const scoreGap = Math.round((ranked[0].score - ranked[1].score) * 10) / 10
+  const allWinProbs = ranked.map((p) => p.winProbability)
+  const probabilityGap = Math.round((ranked[0].winProbability - ranked[1].winProbability) * 1000) / 10
 
   let confidence: BetSuggestions['confidence']
   let boxSize: number
-  if (scoreGap >= 8) {
+  if (probabilityGap >= 12) {
     confidence = '堅い'
     boxSize = 3
-  } else if (scoreGap >= 4) {
+  } else if (probabilityGap >= 6) {
     confidence = 'やや堅い'
     boxSize = 4
   } else {
@@ -328,25 +382,77 @@ export function suggestBets(ranked: HorsePrediction[]): BetSuggestions | null {
   }
   boxSize = Math.min(boxSize, ranked.length)
 
-  const box = ranked.slice(0, boxSize).map(toPick)
-  const axis = box[0]
-  const flowTargets = box.slice(1)
+  // box内の馬の「ranked配列上でのインデックス」(0始まり、1着候補が0)
+  const boxIdx = Array.from({ length: boxSize }, (_, i) => i)
+  const axisIdx = boxIdx[0]
+  const flowIdx = boxIdx.slice(1)
 
-  const umaren = combinations(box, 2) as [Pick, Pick][]
-  const wide = umaren
-  const sanrenpuku = boxSize >= 3 ? (combinations(box, 3) as [Pick, Pick, Pick][]) : []
-  const umatan: [Pick, Pick][] = flowTargets.map((t) => [axis, t])
-  const sanrentan: [Pick, Pick, Pick][] =
-    flowTargets.length >= 2
-      ? (permutations(flowTargets, 2).map(([a, b]) => [axis, a, b]) as [Pick, Pick, Pick][])
+  const umaren: Combo[] = combinationsIdx(boxSize, 2)
+    .map((pair) => {
+      const [i, j] = pair.map((k) => boxIdx[k])
+      return {
+        picks: [toPick(ranked[i]), toPick(ranked[j])],
+        probability: quinellaProbability(allWinProbs[i], allWinProbs[j]),
+      }
+    })
+    .sort(byProbabilityDesc)
+
+  const wide: Combo[] = combinationsIdx(boxSize, 2)
+    .map((pair) => {
+      const [i, j] = pair.map((k) => boxIdx[k])
+      return {
+        picks: [toPick(ranked[i]), toPick(ranked[j])],
+        probability: wideProbability(i, j, allWinProbs),
+      }
+    })
+    .sort(byProbabilityDesc)
+
+  const sanrenpuku: Combo[] =
+    boxSize >= 3
+      ? combinationsIdx(boxSize, 3)
+          .map((trio) => {
+            const [i, j, k] = trio.map((x) => boxIdx[x])
+            return {
+              picks: [toPick(ranked[i]), toPick(ranked[j]), toPick(ranked[k])],
+              probability: trioSetProbability(allWinProbs[i], allWinProbs[j], allWinProbs[k]),
+            }
+          })
+          .sort(byProbabilityDesc)
+      : []
+
+  const umatan: Combo[] = flowIdx
+    .map((j) => ({
+      picks: [toPick(ranked[axisIdx]), toPick(ranked[j])],
+      probability: exactaProbability(allWinProbs[axisIdx], allWinProbs[j]),
+    }))
+    .sort(byProbabilityDesc)
+
+  const sanrentan: Combo[] =
+    flowIdx.length >= 2
+      ? permutationsIdx(flowIdx, 2)
+          .map(([j, k]) => ({
+            picks: [toPick(ranked[axisIdx]), toPick(ranked[j]), toPick(ranked[k])],
+            probability: trifectaOrderProbability(allWinProbs[axisIdx], allWinProbs[j], allWinProbs[k]),
+          }))
+          .sort(byProbabilityDesc)
       : []
 
   return {
     confidence,
-    scoreGap,
+    probabilityGap,
     boxSize,
-    tansho: [toPick(ranked[0])],
-    fukusho: ranked.slice(0, Math.min(3, boxSize)).map(toPick),
+    tansho: [
+      {
+        pick: toPick(ranked[0]),
+        winProbability: ranked[0].winProbability,
+        odds: ranked[0].horse.odds,
+        ev: ranked[0].winEv,
+      },
+    ],
+    fukusho: ranked.slice(0, Math.min(3, boxSize)).map((p) => ({
+      pick: toPick(p),
+      placeProbability: p.placeProbability,
+    })),
     umaren,
     wide,
     umatan,
