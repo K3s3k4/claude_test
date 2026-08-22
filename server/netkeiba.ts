@@ -243,4 +243,112 @@ export async function fetchPedigree(horseId: string): Promise<Pedigree> {
   }
 }
 
+export type PayoutCombo = { umaban: number[]; payout: number }
+
+export type RaceResult = {
+  raceId: string
+  finishOrder: { umaban: number; horseId: string; finishPosition: number }[]
+  payouts: {
+    tansho: PayoutCombo[]
+    fukusho: PayoutCombo[]
+    umaren: PayoutCombo[]
+    wide: PayoutCombo[]
+    umatan: PayoutCombo[] // 着順固定(1着→2着)
+    sanrenpuku: PayoutCombo[]
+    sanrentan: PayoutCombo[] // 着順固定(1着→2着→3着)
+  }
+}
+
+// 単勝・複勝など「1つの<td>にdivが並ぶ」形式から、有効な馬番だけを取り出す
+function parseFlatUmaban($: cheerio.CheerioAPI, td: cheerio.Cheerio<any>): number[] {
+  const vals: number[] = []
+  td.find('div > span').each((_, span) => {
+    const t = $(span).text().trim()
+    if (t) vals.push(Number(t))
+  })
+  return vals
+}
+
+// 馬連・馬単・3連複・3連単など「<ul>ごとに1組」の形式から組み合わせを取り出す
+// (ワイドのみ<ul>が複数、他は1つ)
+function parseUlCombos($: cheerio.CheerioAPI, td: cheerio.Cheerio<any>): number[][] {
+  const combos: number[][] = []
+  td.find('ul').each((_, ul) => {
+    const nums: number[] = []
+    $(ul)
+      .find('li span')
+      .each((_, span) => {
+        const t = $(span).text().trim()
+        if (t) nums.push(Number(t))
+      })
+    if (nums.length > 0) combos.push(nums)
+  })
+  return combos
+}
+
+function parsePayoutValues(td: cheerio.Cheerio<any>): number[] {
+  const html = td.find('span').first().html() || ''
+  return html
+    .split(/<br\s*\/?>/i)
+    .map((s) => Number(s.replace(/[^\d]/g, '')))
+    .filter((n) => Number.isFinite(n) && n > 0)
+}
+
+function combosWithPayouts(umabanGroups: number[][], payouts: number[]): PayoutCombo[] {
+  return umabanGroups.map((umaban, i) => ({ umaban, payout: payouts[i] ?? 0 }))
+}
+
+// レースが確定していればレース結果+払戻を返す。未確定(まだ走っていない)場合はnull。
+export async function fetchRaceResult(raceId: string): Promise<RaceResult | null> {
+  const html = await fetchHtml('https://race.netkeiba.com/race/result.html', { race_id: raceId })
+  const $ = cheerio.load(html)
+
+  const resultTable = $('table.ResultRefund').first()
+  if (resultTable.length === 0) return null
+
+  const finishOrder: RaceResult['finishOrder'] = []
+  resultTable.find('tbody tr.HorseList').each((_, el) => {
+    const row = $(el)
+    const posText = row.find('.Result_Num .Rank').text().trim()
+    const umabanText = row.find('td.Num:not([class*="Waku"])').first().text().trim()
+    const href = row.find('.Horse_Name a').attr('href') || ''
+    const idMatch = href.match(/horse\/(\d+)/)
+    if (!idMatch || !umabanText) return
+    finishOrder.push({
+      umaban: Number(umabanText),
+      horseId: idMatch[1],
+      finishPosition: /^\d+$/.test(posText) ? Number(posText) : 0,
+    })
+  })
+  if (finishOrder.length === 0) return null
+
+  const payoutRow = (cls: string) => $(`tr.${cls}`).first()
+  const flatPayout = (cls: string) => {
+    const row = payoutRow(cls)
+    const umabanGroups = parseFlatUmaban($, row.find('td.Result')).map((u) => [u])
+    const payouts = parsePayoutValues(row.find('td.Payout'))
+    return combosWithPayouts(umabanGroups, payouts)
+  }
+  const ulPayout = (cls: string) => {
+    const row = payoutRow(cls)
+    const umabanGroups = parseUlCombos($, row.find('td.Result'))
+    const payouts = parsePayoutValues(row.find('td.Payout'))
+    return combosWithPayouts(umabanGroups, payouts)
+  }
+
+  return {
+    raceId,
+    finishOrder,
+    payouts: {
+      tansho: flatPayout('Tansho'),
+      fukusho: flatPayout('Fukusho'),
+      umaren: ulPayout('Umaren'),
+      wide: ulPayout('Wide'),
+      umatan: ulPayout('Umatan'),
+      sanrenpuku: ulPayout('Fuku3'),
+      sanrentan: ulPayout('Tan3'),
+    },
+  }
+}
+
 export { sleep }

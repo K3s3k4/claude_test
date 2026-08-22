@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import AppNavbar from './components/AppNavbar'
 import Dashboard from './components/Dashboard'
 import Prediction from './components/Prediction'
+import History from './components/History'
 
 function App() {
   return (
@@ -10,6 +11,7 @@ function App() {
       <Routes>
         <Route path="/" element={<Dashboard />} />
         <Route path="/predict" element={<Prediction />} />
+        <Route path="/history" element={<History />} />
       </Routes>
     </BrowserRouter>
   )

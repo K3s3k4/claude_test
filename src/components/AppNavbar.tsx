@@ -4,6 +4,7 @@ import { NavLink } from 'react-router-dom'
 const NAV_ITEMS = [
   { to: '/', label: 'ダッシュボード' },
   { to: '/predict', label: '競馬予想' },
+  { to: '/history', label: '予想履歴' },
 ]
 
 function AppNavbar() {

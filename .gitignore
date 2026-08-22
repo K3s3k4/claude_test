@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# ローカルSQLite DB (実行時に生成される予想履歴データ)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

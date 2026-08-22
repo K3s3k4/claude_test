@@ -1,7 +1,8 @@
 import express from 'express'
 import cors from 'cors'
-import { fetchRaceCard, fetchHorseHistory, fetchPedigree, sleep } from './netkeiba'
+import { fetchRaceCard, fetchHorseHistory, fetchPedigree, fetchRaceResult, sleep } from './netkeiba'
 import { scoreHorse, rankPredictions, suggestBets } from './predict'
+import { saveRacePrediction, saveRaceResult, getHistory, getStats } from './db'
 
 const app = express()
 app.use(cors())
@@ -37,11 +38,48 @@ app.get('/api/predict/:raceId', async (req, res) => {
 
     const ranked = rankPredictions(predictions)
     const bets = suggestBets(ranked)
+    saveRacePrediction(race, ranked, bets)
     res.json({ race, predictions: ranked, bets })
   } catch (err) {
     console.error(err)
     res.status(502).json({ error: 'netkeiba からのデータ取得に失敗しました。しばらく待って再試行してください。' })
   }
+})
+
+// レース確定後に実際の結果・払戻を取得し、保存済みの予想と照合する
+app.post('/api/results/:raceId', async (req, res) => {
+  const { raceId } = req.params
+  if (!/^\d{8,12}$/.test(raceId)) {
+    res.status(400).json({ error: 'race_id の形式が不正です' })
+    return
+  }
+
+  try {
+    const result = await fetchRaceResult(raceId)
+    if (!result) {
+      res.status(404).json({ error: 'このレースはまだ結果が確定していません。' })
+      return
+    }
+    const { confirmed } = saveRaceResult(raceId, result)
+    if (!confirmed) {
+      res.status(404).json({ error: 'このレースの予想が保存されていません。先に /predict で予想を取得してください。' })
+      return
+    }
+    res.json({ ok: true, result })
+  } catch (err) {
+    console.error(err)
+    res.status(502).json({ error: 'netkeiba からの結果取得に失敗しました。しばらく待って再試行してください。' })
+  }
+})
+
+// 予想履歴の一覧
+app.get('/api/history', (_req, res) => {
+  res.json({ races: getHistory() })
+})
+
+// 券種別の的中率・回収率(100円/点換算)
+app.get('/api/stats', (_req, res) => {
+  res.json({ stats: getStats() })
 })
 
 app.listen(PORT, () => {

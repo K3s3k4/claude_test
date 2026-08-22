@@ -5,7 +5,8 @@
 ## 1. 概要
 
 React製のWebアプリ。ダッシュボード画面と、netkeiba.comから競馬データをスクレイピングして
-血統・過去実績をもとに予想スコアと推奨買い目を算出する「競馬予想」機能を持つ。
+血統・過去実績をもとに予想スコアと推奨買い目を算出する「競馬予想」機能、予想と実際の結果を
+SQLiteに保存し券種別の的中率・回収率を集計する「予想履歴」機能を持つ。
 
 ## 2. 構成
 
@@ -16,13 +17,16 @@ claude-projects/
 │   ├── components/
 │   │   ├── AppNavbar.tsx      # ナビゲーションバー
 │   │   ├── Dashboard.tsx      # ダッシュボード画面 (ダミー統計データ)
-│   │   └── Prediction.tsx     # 競馬予想画面
+│   │   ├── Prediction.tsx     # 競馬予想画面
+│   │   └── History.tsx        # 予想履歴・的中率/回収率画面
 │   └── main.tsx                # エントリポイント (Bootstrap CSS/JS読み込み)
 ├── server/                   # バックエンド (Express + TypeScript, tsx実行)
 │   ├── index.ts                # APIサーバー本体
-│   ├── netkeiba.ts             # netkeibaスクレイピング処理
+│   ├── netkeiba.ts             # netkeibaスクレイピング処理(出馬表/過去成績/血統/結果・払戻)
 │   ├── predict.ts              # 予想スコアリング・買い目生成ロジック
-│   └── probability.ts          # 確率論・数理モデル(softmax/Harville法/経験ベイズ/EV)
+│   ├── probability.ts          # 確率論・数理モデル(softmax/Harville法/経験ベイズ/EV)
+│   └── db.ts                   # SQLite永続化(予想・買い目・結果の保存/照合/集計)
+├── data/predictions.db        # SQLiteデータファイル(gitignore対象、実行時に自動生成)
 ├── vite.config.ts             # /api を localhost:3001 へプロキシ
 └── package.json
 ```
@@ -32,7 +36,7 @@ claude-projects/
 | 分類 | 技術 |
 |---|---|
 | フロントエンド | React 18, TypeScript, Vite 5, react-router-dom, Bootstrap 5, Bootstrap Icons |
-| バックエンド | Express 5, TypeScript (tsx実行), axios, cheerio, iconv-lite |
+| バックエンド | Express 5, TypeScript (tsx実行), axios, cheerio, iconv-lite, better-sqlite3 |
 | 実行環境 | Node.js 24 (LTS) |
 
 ## 3. 画面
@@ -50,6 +54,12 @@ Bootstrapのカード/グリッドで表示する画面。実データとは連�
    - **推奨買い目カード**: 信頼度（堅い/やや堅い/混戦）と単勝〜三連単の推奨買い目（推定的中確率つき、確率降順ソート）
    - **予想結果テーブル**: 予想順位・馬番・馬名・性齢・騎手・脚質・父・人気・スコア・推定勝率
    - 各行の「詳細」ボタンでスコア内訳（進捗バー）と3世代血統（曾祖父母まで）を展開表示
+   - 予想結果は自動的にSQLiteへ保存される（レース確定済みの場合は上書きしない）
+
+### 3.3 予想履歴 (`/history`)
+
+- **券種別 的中率・回収率テーブル**: 結果確定済みレースの買い目を集計し、単勝〜三連単の試行数・的中数・的中率・回収率を表示
+- **予想したレース一覧**: 保存済みの全レースを新しい順に表示。未確定のレースは「結果を取得」ボタンでnetkeibaから確定結果を取得し、保存済みの買い目と自動照合する
 
 ## 4. API仕様
 
@@ -82,6 +92,30 @@ predictions: HorsePrediction[]   // スコア降順、rank付与済み
 bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 ```
 
+### `POST /api/results/:raceId`
+
+レースの確定結果・払戻をnetkeibaから取得し、保存済みの予想・買い目と照合して確定する。
+
+| 項目 | 内容 |
+|---|---|
+| 前提条件 | 事前に`GET /api/predict/:raceId`でそのレースを予想済みであること |
+| レース未確定(結果ページに着順テーブルがない) | 404 `{ error }` |
+| 予想未保存のレース | 404 `{ error }` |
+| 成功時 (200) | `{ ok: true, result: RaceResult }` |
+
+### `GET /api/history`
+
+保存済みの予想レース一覧（最新100件）を返す。`{ races: [{ raceId, raceName, course, predictedAt, confirmedAt }] }`
+
+### `GET /api/stats`
+
+結果確定済みレースの買い目を券種別に集計する。
+`{ stats: [{ betType, attempts, hits, hitRate, totalPayout, returnRate }] }`
+
+- `attempts`: 推奨買い目の点数（1組=1点としてカウント）
+- `hitRate`: `hits / attempts × 100` (%)
+- `returnRate`: 1点100円で購入した想定の回収率 = `totalPayout / (attempts × 100) × 100` (%)
+
 ## 5. データ取得元 (netkeiba.ts)
 
 | 関数 | 取得元URL | 内容 |
@@ -89,6 +123,7 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 | `fetchRaceCard` | `race.netkeiba.com/race/shutuba.html?race_id=` | 出走馬一覧・枠番・馬番・斤量・騎手・厩舎・馬体重・オッズ・人気 |
 | `fetchHorseHistory` | `db.netkeiba.com/horse/result/{horseId}/` | 過去全レースの日付・開催・距離・馬場状態・着順・人気・騎手・タイム・通過順位・上がり3F |
 | `fetchPedigree` | `db.netkeiba.com/horse/ped/{horseId}/` | 5代血統表HTMLを`rowspan`展開して3世代（父母・祖父母4頭・曾祖父母8頭、計14頭）を復元 |
+| `fetchRaceResult` | `race.netkeiba.com/race/result.html?race_id=` | 確定着順・単勝〜三連単の払戻金額を取得。結果未確定の場合は`null`を返す |
 
 ページはEUC-JPで配信されるため、バイナリ取得後にUTF-8判定→フォールバックでEUC-JPデコードする。
 
@@ -154,7 +189,30 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 
 出走3頭未満の場合は`bets: null`を返す。
 
-## 9. 開発・実行方法
+## 9. DB永続化 (db.ts)
+
+SQLite（`better-sqlite3`、ファイル: `data/predictions.db`）に予想・買い目・結果を保存する。
+
+**テーブル構成**
+
+| テーブル | 内容 |
+|---|---|
+| `races` | レース基本情報、予想日時(`predicted_at`)、結果確定日時(`confirmed_at`、未確定は`NULL`) |
+| `predictions` | レースごとの各馬の予想（スコア・推定勝率・推定複勝率・着順）。結果確定前は`finish_position`が`NULL` |
+| `bets` | 推奨買い目1組ごとの券種・馬番の組み合わせ・推定確率・的中可否(`hit`)・払戻金額(`payout`)。結果確定前は`hit`/`payout`が`NULL` |
+
+**保存・照合の流れ**
+
+1. `GET /api/predict/:raceId` 実行時、`saveRacePrediction`がレース・予想・買い目を保存する。
+   同じレースを再度予想すると、**結果未確定であれば**上書き（既存の予想・買い目を削除して再挿入）、
+   **結果確定済みであれば**上書きしない（確定済みの実績を保持するため）。
+2. `POST /api/results/:raceId` 実行時、`saveRaceResult`が着順・払戻をnetkeibaから取得し、
+   保存済みの`bets`の馬番の組み合わせと突き合わせて的中判定・払戻金額を確定する。
+   券種ごとに「着順を問わない（馬連・ワイド・三連複）」ものは馬番を昇順に正規化して比較し、
+   「着順固定（馬単・三連単）」のものは予想順のまま比較する。
+3. `GET /api/stats`が結果確定済みレースの`bets`を券種別に集計する。
+
+## 10. 開発・実行方法
 
 ```bash
 npm install
@@ -166,21 +224,20 @@ npm run dev:all     # フロントエンド(5173) + APIサーバー(3001) を同
 ビルド: `npm run build`（`tsc -b && vite build`。server/配下は含まれない。型チェックは
 `npx tsc -p tsconfig.server.json --noEmit` で個別に実施）
 
-## 10. 既知の制約・未実装事項
+## 11. 既知の制約・未実装事項
 
-- 予想結果の保存機能なし（過去の予想を振り返ることができない）
-- 実際のレース結果（着順・払戻金）を取得する機能なし
-- 上記2点により、**的中率の集計は未対応**
 - 血統評価は簡易リストベースで、統計的裏付けのある血統データベースではない
 - 確率モデルのパラメータ（softmax温度・経験ベイズ補正定数）は未キャリブレーション
 - 複勝・馬連など単勝以外のオッズは未取得のため、EVは単勝のみ算出
 - オッズ・人気はレース発走が近づくまで取得できないことが多い（`null`で返る）
 - netkeibaのHTML構造変更に弱い（セレクタ・列インデックスのハードコード依存）
+- 結果確定は手動（`/history`画面で「結果を取得」を押す必要があり、自動巡回はしていない）
+- 券種別の的中率・回収率は「1点=100円」という仮定に基づく参考値であり、実際の購入金額とは異なる場合がある
 
-## 11. 今後の拡張候補
+## 12. 今後の拡張候補
 
-- 予想結果の自動保存（DB導入）
-- レース確定後の結果自動取得・照合による的中率集計（券種別）
 - 過去レース結果を教師データとした統計的モデル（ロジスティック回帰等）へのキャリブレーション
 - 血統評価の統計データベース化
 - 複勝・馬連等のオッズ取得によるEV計算の全券種対応
+- レース確定の自動チェック（定期ポーリングやcron）
+- 購入金額を考慮した実際の収支管理
