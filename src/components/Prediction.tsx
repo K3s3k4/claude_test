@@ -65,9 +65,25 @@ type RaceCard = {
   horses: RaceCardHorse[]
 }
 
+type Pick = { umaban: number; name: string }
+
+type BetSuggestions = {
+  confidence: '堅い' | 'やや堅い' | '混戦'
+  scoreGap: number
+  boxSize: number
+  tansho: Pick[]
+  fukusho: Pick[]
+  umaren: [Pick, Pick][]
+  wide: [Pick, Pick][]
+  umatan: [Pick, Pick][]
+  sanrenpuku: [Pick, Pick, Pick][]
+  sanrentan: [Pick, Pick, Pick][]
+}
+
 type ApiResponse = {
   race: RaceCard
   predictions: HorsePrediction[]
+  bets: BetSuggestions | null
 }
 
 const BREAKDOWN_LABELS: Record<keyof PredictionBreakdown, string> = {
@@ -94,6 +110,90 @@ function rankBadgeClass(rank: number) {
   if (rank === 2) return 'bg-secondary'
   if (rank === 3) return 'bg-secondary bg-opacity-50'
   return 'bg-light text-dark border'
+}
+
+function confidenceBadgeClass(confidence: BetSuggestions['confidence']) {
+  if (confidence === '堅い') return 'bg-success'
+  if (confidence === 'やや堅い') return 'bg-primary'
+  return 'bg-danger'
+}
+
+function PickBadge({ pick }: { pick: Pick }) {
+  return (
+    <span className="badge bg-white text-dark border me-1">
+      {pick.umaban} {pick.name}
+    </span>
+  )
+}
+
+function CombosRow({
+  label,
+  combos,
+  ordered = false,
+}: {
+  label: string
+  combos: Pick[][]
+  ordered?: boolean
+}) {
+  if (combos.length === 0) return null
+  const separator = ordered ? '→' : '-'
+  return (
+    <div className="mb-2">
+      <div className="text-muted small mb-1">
+        {label}
+        <span className="ms-1">({combos.length}点)</span>
+      </div>
+      <div className="d-flex flex-wrap gap-1">
+        {combos.map((combo, i) => (
+          <span key={i} className="badge bg-light text-dark border fw-normal">
+            {combo.map((p) => `${p.umaban}`).join(separator)}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function BetSuggestionsCard({ bets }: { bets: BetSuggestions }) {
+  return (
+    <div className="card border-0 shadow-sm mb-3">
+      <div className="card-body">
+        <div className="d-flex align-items-center gap-2 mb-3">
+          <h2 className="h6 fw-bold mb-0">推奨買い目</h2>
+          <span className={`badge ${confidenceBadgeClass(bets.confidence)}`}>{bets.confidence}</span>
+          <span className="text-muted small">1位-2位スコア差: {bets.scoreGap}</span>
+        </div>
+
+        <div className="row g-3">
+          <div className="col-md-6">
+            <div className="mb-2">
+              <div className="text-muted small mb-1">単勝</div>
+              {bets.tansho.map((p) => (
+                <PickBadge key={p.umaban} pick={p} />
+              ))}
+            </div>
+            <div className="mb-2">
+              <div className="text-muted small mb-1">複勝</div>
+              {bets.fukusho.map((p) => (
+                <PickBadge key={p.umaban} pick={p} />
+              ))}
+            </div>
+            <CombosRow label="馬連" combos={bets.umaren} />
+            <CombosRow label="ワイド" combos={bets.wide} />
+          </div>
+          <div className="col-md-6">
+            <CombosRow label="馬単" combos={bets.umatan} ordered />
+            <CombosRow label="三連複" combos={bets.sanrenpuku} />
+            <CombosRow label="三連単" combos={bets.sanrentan} ordered />
+          </div>
+        </div>
+        <p className="text-muted small mb-0 mt-2">
+          <i className="bi bi-info-circle me-1" />
+          スコア上位{bets.boxSize}頭を基準に自動生成した参考買い目です。馬単・三連単は1位を軸に固定しています。
+        </p>
+      </div>
+    </div>
+  )
 }
 
 function Prediction() {
@@ -178,6 +278,8 @@ function Prediction() {
               <div className="text-muted small">{data.race.course}</div>
             </div>
           </div>
+
+          {data.bets && <BetSuggestionsCard bets={data.bets} />}
 
           <div className="table-responsive">
             <table className="table table-hover align-middle bg-white shadow-sm">

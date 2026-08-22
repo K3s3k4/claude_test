@@ -269,3 +269,88 @@ export function rankPredictions(predictions: Omit<HorsePrediction, 'rank'>[]): H
     .sort((a, b) => b.score - a.score)
     .map((p, i) => ({ ...p, rank: i + 1 }))
 }
+
+// --- 買い目推奨 ---
+
+type Pick = { umaban: number; name: string }
+
+export type BetSuggestions = {
+  confidence: '堅い' | 'やや堅い' | '混戦'
+  scoreGap: number // 1位と2位のスコア差
+  boxSize: number // 軸+ヒモとして採用した頭数
+  tansho: Pick[] // 単勝
+  fukusho: Pick[] // 複勝
+  umaren: [Pick, Pick][] // 馬連(BOX)
+  wide: [Pick, Pick][] // ワイド(BOX)
+  umatan: [Pick, Pick][] // 馬単(1着軸流し)
+  sanrenpuku: [Pick, Pick, Pick][] // 三連複(BOX)
+  sanrentan: [Pick, Pick, Pick][] // 三連単(1着軸2-3着流し)
+}
+
+function combinations<T>(arr: T[], k: number): T[][] {
+  if (k === 0) return [[]]
+  if (arr.length < k) return []
+  const [head, ...rest] = arr
+  const withHead = combinations(rest, k - 1).map((c) => [head, ...c])
+  const withoutHead = combinations(rest, k)
+  return [...withHead, ...withoutHead]
+}
+
+function permutations<T>(arr: T[], k: number): T[][] {
+  if (k === 0) return [[]]
+  const result: T[][] = []
+  arr.forEach((item, i) => {
+    const rest = [...arr.slice(0, i), ...arr.slice(i + 1)]
+    for (const p of permutations(rest, k - 1)) {
+      result.push([item, ...p])
+    }
+  })
+  return result
+}
+
+export function suggestBets(ranked: HorsePrediction[]): BetSuggestions | null {
+  if (ranked.length < 3) return null
+
+  const toPick = (p: HorsePrediction): Pick => ({ umaban: p.horse.umaban, name: p.horse.name })
+  const scoreGap = Math.round((ranked[0].score - ranked[1].score) * 10) / 10
+
+  let confidence: BetSuggestions['confidence']
+  let boxSize: number
+  if (scoreGap >= 8) {
+    confidence = '堅い'
+    boxSize = 3
+  } else if (scoreGap >= 4) {
+    confidence = 'やや堅い'
+    boxSize = 4
+  } else {
+    confidence = '混戦'
+    boxSize = 5
+  }
+  boxSize = Math.min(boxSize, ranked.length)
+
+  const box = ranked.slice(0, boxSize).map(toPick)
+  const axis = box[0]
+  const flowTargets = box.slice(1)
+
+  const umaren = combinations(box, 2) as [Pick, Pick][]
+  const wide = umaren
+  const sanrenpuku = boxSize >= 3 ? (combinations(box, 3) as [Pick, Pick, Pick][]) : []
+  const umatan: [Pick, Pick][] = flowTargets.map((t) => [axis, t])
+  const sanrentan: [Pick, Pick, Pick][] =
+    flowTargets.length >= 2
+      ? (permutations(flowTargets, 2).map(([a, b]) => [axis, a, b]) as [Pick, Pick, Pick][])
+      : []
+
+  return {
+    confidence,
+    scoreGap,
+    boxSize,
+    tansho: [toPick(ranked[0])],
+    fukusho: ranked.slice(0, Math.min(3, boxSize)).map(toPick),
+    umaren,
+    wide,
+    umatan,
+    sanrenpuku,
+    sanrentan,
+  }
+}

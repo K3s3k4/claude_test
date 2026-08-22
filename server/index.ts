@@ -1,7 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { fetchRaceCard, fetchHorseHistory, fetchPedigree, sleep } from './netkeiba'
-import { scoreHorse, rankPredictions } from './predict'
+import { scoreHorse, rankPredictions, suggestBets } from './predict'
 
 const app = express()
 app.use(cors())
@@ -36,7 +36,8 @@ app.get('/api/predict/:raceId', async (req, res) => {
     }
 
     const ranked = rankPredictions(predictions)
-    res.json({ race, predictions: ranked })
+    const bets = suggestBets(ranked)
+    res.json({ race, predictions: ranked, bets })
   } catch (err) {
     console.error(err)
     res.status(502).json({ error: 'netkeiba からのデータ取得に失敗しました。しばらく待って再試行してください。' })
