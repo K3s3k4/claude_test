@@ -361,6 +361,13 @@ function byProbabilityDesc(a: Combo, b: Combo) {
   return b.probability - a.probability
 }
 
+// 「自信がある買い目」として提示する上限点数。BOX全通りではなく確率上位のみに絞る。
+const TOP_N_PER_BET_TYPE = 3
+
+function topN(combos: Combo[]): Combo[] {
+  return combos.slice(0, TOP_N_PER_BET_TYPE)
+}
+
 export function suggestBets(ranked: HorsePrediction[]): BetSuggestions | null {
   if (ranked.length < 3) return null
 
@@ -387,54 +394,64 @@ export function suggestBets(ranked: HorsePrediction[]): BetSuggestions | null {
   const axisIdx = boxIdx[0]
   const flowIdx = boxIdx.slice(1)
 
-  const umaren: Combo[] = combinationsIdx(boxSize, 2)
-    .map((pair) => {
-      const [i, j] = pair.map((k) => boxIdx[k])
-      return {
-        picks: [toPick(ranked[i]), toPick(ranked[j])],
-        probability: quinellaProbability(allWinProbs[i], allWinProbs[j]),
-      }
-    })
-    .sort(byProbabilityDesc)
+  const umaren: Combo[] = topN(
+    combinationsIdx(boxSize, 2)
+      .map((pair) => {
+        const [i, j] = pair.map((k) => boxIdx[k])
+        return {
+          picks: [toPick(ranked[i]), toPick(ranked[j])],
+          probability: quinellaProbability(allWinProbs[i], allWinProbs[j]),
+        }
+      })
+      .sort(byProbabilityDesc),
+  )
 
-  const wide: Combo[] = combinationsIdx(boxSize, 2)
-    .map((pair) => {
-      const [i, j] = pair.map((k) => boxIdx[k])
-      return {
-        picks: [toPick(ranked[i]), toPick(ranked[j])],
-        probability: wideProbability(i, j, allWinProbs),
-      }
-    })
-    .sort(byProbabilityDesc)
+  const wide: Combo[] = topN(
+    combinationsIdx(boxSize, 2)
+      .map((pair) => {
+        const [i, j] = pair.map((k) => boxIdx[k])
+        return {
+          picks: [toPick(ranked[i]), toPick(ranked[j])],
+          probability: wideProbability(i, j, allWinProbs),
+        }
+      })
+      .sort(byProbabilityDesc),
+  )
 
   const sanrenpuku: Combo[] =
     boxSize >= 3
-      ? combinationsIdx(boxSize, 3)
-          .map((trio) => {
-            const [i, j, k] = trio.map((x) => boxIdx[x])
-            return {
-              picks: [toPick(ranked[i]), toPick(ranked[j]), toPick(ranked[k])],
-              probability: trioSetProbability(allWinProbs[i], allWinProbs[j], allWinProbs[k]),
-            }
-          })
-          .sort(byProbabilityDesc)
+      ? topN(
+          combinationsIdx(boxSize, 3)
+            .map((trio) => {
+              const [i, j, k] = trio.map((x) => boxIdx[x])
+              return {
+                picks: [toPick(ranked[i]), toPick(ranked[j]), toPick(ranked[k])],
+                probability: trioSetProbability(allWinProbs[i], allWinProbs[j], allWinProbs[k]),
+              }
+            })
+            .sort(byProbabilityDesc),
+        )
       : []
 
-  const umatan: Combo[] = flowIdx
-    .map((j) => ({
-      picks: [toPick(ranked[axisIdx]), toPick(ranked[j])],
-      probability: exactaProbability(allWinProbs[axisIdx], allWinProbs[j]),
-    }))
-    .sort(byProbabilityDesc)
+  const umatan: Combo[] = topN(
+    flowIdx
+      .map((j) => ({
+        picks: [toPick(ranked[axisIdx]), toPick(ranked[j])],
+        probability: exactaProbability(allWinProbs[axisIdx], allWinProbs[j]),
+      }))
+      .sort(byProbabilityDesc),
+  )
 
   const sanrentan: Combo[] =
     flowIdx.length >= 2
-      ? permutationsIdx(flowIdx, 2)
-          .map(([j, k]) => ({
-            picks: [toPick(ranked[axisIdx]), toPick(ranked[j]), toPick(ranked[k])],
-            probability: trifectaOrderProbability(allWinProbs[axisIdx], allWinProbs[j], allWinProbs[k]),
-          }))
-          .sort(byProbabilityDesc)
+      ? topN(
+          permutationsIdx(flowIdx, 2)
+            .map(([j, k]) => ({
+              picks: [toPick(ranked[axisIdx]), toPick(ranked[j]), toPick(ranked[k])],
+              probability: trifectaOrderProbability(allWinProbs[axisIdx], allWinProbs[j], allWinProbs[k]),
+            }))
+            .sort(byProbabilityDesc),
+        )
       : []
 
   return {

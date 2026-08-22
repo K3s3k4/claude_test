@@ -43,15 +43,18 @@ claude-projects/
 
 ### 3.1 ダッシュボード (`/`)
 
-固定のダミー統計データ（総ユーザー数・売上・注文数・コンバージョン率）と最近のアクティビティ一覧を
-Bootstrapのカード/グリッドで表示する画面。実データとは連携していない。
+- **直近の自信がある買い目**: 直近に予想したレース最大4件について、券種別の上位買い目（確率つき）を表示。
+  「開催予定レースを取得して予想」ボタンで、今日以降の開催予定レースを自動検出し、まとめて予想・保存できる
+  （時間がかかる処理のためバックグラウンドジョブとして実行し、進捗をポーリング表示する）
+- 固定のダミー統計データ（総ユーザー数・売上・注文数・コンバージョン率）と最近のアクティビティ一覧を
+  Bootstrapのカード/グリッドで表示（実データとは連携していない）
 
 ### 3.2 競馬予想 (`/predict`)
 
 1. netkeibaのrace_id（12桁）またはレースURLを入力
 2. `GET /api/predict/:raceId` を呼び出し、出走馬ごとの過去成績・血統を取得してスコアリング
 3. 結果を以下の形式で表示
-   - **推奨買い目カード**: 信頼度（堅い/やや堅い/混戦）と単勝〜三連単の推奨買い目（推定的中確率つき、確率降順ソート）
+   - **推奨買い目カード**: 信頼度（堅い/やや堅い/混戦）と単勝〜三連単の推奨買い目（推定的中確率つき、券種ごとに確率上位3点までに絞って表示）
    - **予想結果テーブル**: 予想順位・馬番・馬名・性齢・騎手・脚質・父・人気・スコア・推定勝率
    - 各行の「詳細」ボタンでスコア内訳（進捗バー）と3世代血統（曾祖父母まで）を展開表示
    - 予想結果は自動的にSQLiteへ保存される（レース確定済みの場合は上書きしない）
@@ -105,7 +108,7 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 
 ### `GET /api/history`
 
-保存済みの予想レース一覧（最新100件）を返す。`{ races: [{ raceId, raceName, course, predictedAt, confirmedAt }] }`
+保存済みの予想レース一覧（最新100件）を返す。`{ races: [{ raceId, raceName, course, predictedAt, confirmedAt, confidence }] }`
 
 ### `GET /api/stats`
 
@@ -116,6 +119,28 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 - `hitRate`: `hits / attempts × 100` (%)
 - `returnRate`: 1点100円で購入した想定の回収率 = `totalPayout / (attempts × 100) × 100` (%)
 
+### `GET /api/dashboard/recent-picks?limit=4`
+
+直近に予想したレース最大`limit`件について、券種別の買い目（馬名・確率つき）を返す。
+`{ picks: [{ raceId, raceName, course, predictedAt, confidence, probabilityGap, betsByType }] }`
+
+### `POST /api/batch-predict`
+
+今日以降の開催予定レースを自動検出し、複数レースをまとめて予想・保存するバックグラウンドジョブを開始する。
+処理に時間がかかるため（1レースあたり出走馬数×約0.5秒+スクレイピング時間）、即座に`jobId`を返し、
+実際の処理は非同期で進む。
+
+| 項目 | 内容 |
+|---|---|
+| リクエストボディ | `{ count?: number }`（デフォルト4、最大10） |
+| レスポンス | `{ jobId: string }` |
+
+### `GET /api/batch-predict/:jobId`
+
+ジョブの進捗を返す。`{ status: 'running'|'done'|'error', total, completed, raceIds, error? }`
+フロントエンドは数秒間隔でポーリングして進捗を表示する想定。ジョブ状態はサーバーのメモリ上にのみ保持され、
+サーバー再起動で失われる。
+
 ## 5. データ取得元 (netkeiba.ts)
 
 | 関数 | 取得元URL | 内容 |
@@ -124,6 +149,7 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 | `fetchHorseHistory` | `db.netkeiba.com/horse/result/{horseId}/` | 過去全レースの日付・開催・距離・馬場状態・着順・人気・騎手・タイム・通過順位・上がり3F |
 | `fetchPedigree` | `db.netkeiba.com/horse/ped/{horseId}/` | 5代血統表HTMLを`rowspan`展開して3世代（父母・祖父母4頭・曾祖父母8頭、計14頭）を復元 |
 | `fetchRaceResult` | `race.netkeiba.com/race/result.html?race_id=` | 確定着順・単勝〜三連単の払戻金額を取得。結果未確定の場合は`null`を返す |
+| `discoverUpcomingRaceIds` | `race.netkeiba.com/top/race_list_sub.html?kaisai_date=` | 今日から最大21日先まで日付を進めながら開催日を探し、`shutuba.html`リンクから未確定のrace_idを指定件数集める |
 
 ページはEUC-JPで配信されるため、バイナリ取得後にUTF-8判定→フォールバックでEUC-JPデコードする。
 
@@ -180,12 +206,12 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
    - 12pt以上 → 「堅い」→ BOX 3頭
    - 6〜12pt未満 → 「やや堅い」→ BOX 4頭
    - 6pt未満 → 「混戦」→ BOX 5頭
-2. 上位BOX頭数から各券種の組み合わせを生成し、**Harvilleモデルで算出した的中確率の降順**でソートして返す
+2. 上位BOX頭数から各券種の組み合わせを生成し、**Harvilleモデルで算出した的中確率の降順**でソートした上で、
+   **券種ごとに上位3点（`TOP_N_PER_BET_TYPE`）まで**に絞り込んで返す（BOX全通りではなく「自信がある買い目」を提示するため）
    - 単勝: 推定勝率・オッズ・EVを付与
    - 複勝: 推定複勝率を付与
-   - 馬連・ワイド: BOX全頭の組み合わせ（確率順）
-   - 馬単・三連単: 1位を軸に固定し、2着（・3着）へBOX内の他馬を流す（確率順）
-   - 三連複: BOX全頭の組み合わせ（確率順）
+   - 馬連・ワイド・三連複: BOXの組み合わせのうち確率上位3点
+   - 馬単・三連単: 1位を軸に固定し、2着（・3着）へBOX内の他馬を流した組み合わせのうち確率上位3点
 
 出走3頭未満の場合は`bets: null`を返す。
 
@@ -197,7 +223,7 @@ SQLite（`better-sqlite3`、ファイル: `data/predictions.db`）に予想・�
 
 | テーブル | 内容 |
 |---|---|
-| `races` | レース基本情報、予想日時(`predicted_at`)、結果確定日時(`confirmed_at`、未確定は`NULL`) |
+| `races` | レース基本情報、予想日時(`predicted_at`)、結果確定日時(`confirmed_at`、未確定は`NULL`)、信頼度(`confidence`/`probability_gap`/`box_size`) |
 | `predictions` | レースごとの各馬の予想（スコア・推定勝率・推定複勝率・着順）。結果確定前は`finish_position`が`NULL` |
 | `bets` | 推奨買い目1組ごとの券種・馬番の組み合わせ・推定確率・的中可否(`hit`)・払戻金額(`payout`)。結果確定前は`hit`/`payout`が`NULL` |
 
@@ -233,6 +259,8 @@ npm run dev:all     # フロントエンド(5173) + APIサーバー(3001) を同
 - netkeibaのHTML構造変更に弱い（セレクタ・列インデックスのハードコード依存）
 - 結果確定は手動（`/history`画面で「結果を取得」を押す必要があり、自動巡回はしていない）
 - 券種別の的中率・回収率は「1点=100円」という仮定に基づく参考値であり、実際の購入金額とは異なる場合がある
+- バッチ予想ジョブ(`/api/batch-predict`)の状態はサーバーのメモリ上のみに保持され、サーバー再起動で失われる
+- 開催予定レースの自動検出は「今日から最大21日先まで」を走査するため、該当レースがない期間が続くと時間がかかる場合がある
 
 ## 12. 今後の拡張候補
 
@@ -241,3 +269,4 @@ npm run dev:all     # フロントエンド(5173) + APIサーバー(3001) を同
 - 複勝・馬連等のオッズ取得によるEV計算の全券種対応
 - レース確定の自動チェック（定期ポーリングやcron）
 - 購入金額を考慮した実際の収支管理
+- バッチ予想ジョブの進捗をDB等に永続化し、サーバー再起動後も参照可能にする

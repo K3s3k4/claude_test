@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS races (
   surface TEXT,
   track_condition TEXT,
   predicted_at TEXT NOT NULL,
-  confirmed_at TEXT
+  confirmed_at TEXT,
+  confidence TEXT,
+  probability_gap REAL,
+  box_size INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -48,6 +51,17 @@ CREATE INDEX IF NOT EXISTS idx_bets_race ON bets(race_id);
 CREATE INDEX IF NOT EXISTS idx_bets_type ON bets(bet_type);
 `)
 
+// 既存DBファイルに新しいカラムを後から追加するための簡易マイグレーション
+function ensureColumn(table: string, column: string, declaration: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`)
+  }
+}
+ensureColumn('races', 'confidence', 'TEXT')
+ensureColumn('races', 'probability_gap', 'REAL')
+ensureColumn('races', 'box_size', 'INTEGER')
+
 // 着順を問わない券種(馬連/ワイド/三連複)は昇順に正規化し、
 // 着順固定の券種(馬単/三連単)は推定順のまま比較キーにする
 const ORDERED_BET_TYPES = new Set(['umatan', 'sanrentan'])
@@ -67,11 +81,14 @@ export function saveRacePrediction(
   if (existing?.confirmed_at) return // 結果確定済みのレースは予想を上書きしない
 
   const upsertRace = db.prepare(`
-    INSERT INTO races (race_id, race_name, course, distance, surface, track_condition, predicted_at)
-    VALUES (@raceId, @raceName, @course, @distance, @surface, @trackCondition, @predictedAt)
+    INSERT INTO races (race_id, race_name, course, distance, surface, track_condition, predicted_at,
+                        confidence, probability_gap, box_size)
+    VALUES (@raceId, @raceName, @course, @distance, @surface, @trackCondition, @predictedAt,
+            @confidence, @probabilityGap, @boxSize)
     ON CONFLICT(race_id) DO UPDATE SET
       race_name=excluded.race_name, course=excluded.course, distance=excluded.distance,
-      surface=excluded.surface, track_condition=excluded.track_condition, predicted_at=excluded.predicted_at
+      surface=excluded.surface, track_condition=excluded.track_condition, predicted_at=excluded.predicted_at,
+      confidence=excluded.confidence, probability_gap=excluded.probability_gap, box_size=excluded.box_size
   `)
 
   const deletePredictions = db.prepare('DELETE FROM predictions WHERE race_id = ?')
@@ -94,6 +111,9 @@ export function saveRacePrediction(
       surface: race.surface,
       trackCondition: race.trackCondition,
       predictedAt: new Date().toISOString(),
+      confidence: bets?.confidence ?? null,
+      probabilityGap: bets?.probabilityGap ?? null,
+      boxSize: bets?.boxSize ?? null,
     })
     deletePredictions.run(race.raceId)
     deleteBets.run(race.raceId)
@@ -190,10 +210,79 @@ export function getHistory() {
   return db
     .prepare(
       `SELECT race_id as raceId, race_name as raceName, course, predicted_at as predictedAt,
-              confirmed_at as confirmedAt
+              confirmed_at as confirmedAt, confidence
        FROM races ORDER BY predicted_at DESC LIMIT 100`,
     )
     .all()
+}
+
+export type RecentPickCombo = { umabanCombo: string; names: string; probability: number }
+export type RecentPick = {
+  raceId: string
+  raceName: string
+  course: string
+  predictedAt: string
+  confidence: string | null
+  probabilityGap: number | null
+  betsByType: Record<string, RecentPickCombo[]>
+}
+
+// ダッシュボード表示用: 直近N件の予想レースについて、券種ごとの上位買い目(馬名つき)を返す
+export function getRecentPicks(limit = 4): RecentPick[] {
+  const races = db
+    .prepare(
+      `SELECT race_id as raceId, race_name as raceName, course, predicted_at as predictedAt,
+              confidence, probability_gap as probabilityGap
+       FROM races ORDER BY predicted_at DESC LIMIT ?`,
+    )
+    .all(limit) as {
+    raceId: string
+    raceName: string
+    course: string
+    predictedAt: string
+    confidence: string | null
+    probabilityGap: number | null
+  }[]
+
+  if (races.length === 0) return []
+
+  const raceIds = races.map((r) => r.raceId)
+  const placeholders = raceIds.map(() => '?').join(',')
+
+  const bets = db
+    .prepare(
+      `SELECT race_id as raceId, bet_type as betType, umaban_combo as umabanCombo, probability
+       FROM bets WHERE race_id IN (${placeholders})`,
+    )
+    .all(...raceIds) as { raceId: string; betType: string; umabanCombo: string; probability: number }[]
+
+  const predictions = db
+    .prepare(
+      `SELECT race_id as raceId, umaban, name
+       FROM predictions WHERE race_id IN (${placeholders})`,
+    )
+    .all(...raceIds) as { raceId: string; umaban: number; name: string }[]
+
+  const nameByRaceUmaban = new Map<string, string>()
+  for (const p of predictions) {
+    nameByRaceUmaban.set(`${p.raceId}:${p.umaban}`, p.name)
+  }
+
+  return races.map((r) => {
+    const betsByType: Record<string, RecentPickCombo[]> = {}
+    for (const b of bets.filter((x) => x.raceId === r.raceId)) {
+      const names = b.umabanCombo
+        .split(',')
+        .map((u) => nameByRaceUmaban.get(`${r.raceId}:${u}`) ?? u)
+        .join(' - ')
+      if (!betsByType[b.betType]) betsByType[b.betType] = []
+      betsByType[b.betType].push({ umabanCombo: b.umabanCombo, names, probability: b.probability })
+    }
+    for (const type of Object.keys(betsByType)) {
+      betsByType[type].sort((a, b) => b.probability - a.probability)
+    }
+    return { ...r, betsByType }
+  })
 }
 
 export type BetTypeStats = {

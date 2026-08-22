@@ -351,4 +351,45 @@ export async function fetchRaceResult(raceId: string): Promise<RaceResult | null
   }
 }
 
+function toKaisaiDate(date: Date): string {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}${m}${d}`
+}
+
+// 今日以降の開催予定レース(まだ結果が出ていないレース)のrace_idを、
+// 日付を進めながら開催日が見つかるまで探索して集める
+export async function discoverUpcomingRaceIds(
+  targetCount: number,
+  maxDaysAhead = 21,
+  startDate: Date = new Date(),
+): Promise<string[]> {
+  const raceIds: string[] = []
+
+  for (let dayOffset = 0; dayOffset < maxDaysAhead && raceIds.length < targetCount; dayOffset++) {
+    const date = new Date(startDate)
+    date.setDate(date.getDate() + dayOffset)
+    const kaisaiDate = toKaisaiDate(date)
+
+    let html: string
+    try {
+      html = await fetchHtml('https://race.netkeiba.com/top/race_list_sub.html', { kaisai_date: kaisaiDate })
+    } catch {
+      continue
+    }
+
+    const matches = [...html.matchAll(/shutuba\.html\?race_id=(\d+)/g)]
+    const idsForDay = [...new Set(matches.map((m) => m[1]))]
+    for (const id of idsForDay) {
+      if (!raceIds.includes(id)) raceIds.push(id)
+      if (raceIds.length >= targetCount) break
+    }
+
+    if (dayOffset < maxDaysAhead - 1) await sleep(300)
+  }
+
+  return raceIds.slice(0, targetCount)
+}
+
 export { sleep }
