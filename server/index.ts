@@ -6,10 +6,18 @@ import {
   fetchPedigree,
   fetchRaceResult,
   discoverUpcomingRaceIds,
-  sleep,
+  jitteredSleep,
 } from './netkeiba'
 import { scoreHorse, rankPredictions, suggestBets } from './predict'
-import { saveRacePrediction, saveRaceResult, getHistory, getStats, getRecentPicks } from './db'
+import {
+  saveRacePrediction,
+  saveRaceResult,
+  getHistory,
+  getStats,
+  getRecentPicks,
+  getCachedHorse,
+  saveCachedHorse,
+} from './db'
 
 const app = express()
 app.use(cors())
@@ -17,8 +25,29 @@ app.use(express.json())
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001
 
-// 相手サーバーへの負荷を抑えるため、馬ごとの取得は直列 + インターバルを空けて行う
-const REQUEST_INTERVAL_MS = 400
+// 相手サーバーへの負荷を抑えるため、馬ごとの取得は直列 + ランダムな間隔を空けて行う
+const REQUEST_INTERVAL_MS: [number, number] = [400, 900]
+// レースとレースの間の休止(バッチ予想時)
+const BETWEEN_RACES_INTERVAL_MS: [number, number] = [3000, 8000]
+// 過去成績のキャッシュ有効期間。血統は不変なので無期限にキャッシュを使う。
+const HISTORY_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000
+
+async function getHorseData(horseId: string) {
+  const cached = getCachedHorse(horseId)
+  const historyFresh = !!cached && Date.now() - new Date(cached.historyFetchedAt).getTime() < HISTORY_CACHE_TTL_MS
+
+  if (cached && historyFresh) {
+    return { history: cached.history, pedigree: cached.pedigree }
+  }
+
+  await jitteredSleep(...REQUEST_INTERVAL_MS)
+  const [history, pedigree] = await Promise.all([
+    historyFresh ? Promise.resolve(cached!.history) : fetchHorseHistory(horseId),
+    cached ? Promise.resolve(cached.pedigree) : fetchPedigree(horseId), // 血統は不変なのでキャッシュがあれば常に使う
+  ])
+  saveCachedHorse(horseId, pedigree, history)
+  return { history, pedigree }
+}
 
 async function predictRace(raceId: string) {
   const race = await fetchRaceCard(raceId)
@@ -26,11 +55,7 @@ async function predictRace(raceId: string) {
 
   const predictions = []
   for (const horse of race.horses) {
-    await sleep(REQUEST_INTERVAL_MS)
-    const [history, pedigree] = await Promise.all([
-      fetchHorseHistory(horse.horseId),
-      fetchPedigree(horse.horseId),
-    ])
+    const { history, pedigree } = await getHorseData(horse.horseId)
     predictions.push(scoreHorse(race, horse, history, pedigree))
   }
 
@@ -125,9 +150,10 @@ app.post('/api/batch-predict', (req, res) => {
       const raceIds = await discoverUpcomingRaceIds(count)
       job.total = raceIds.length
       job.raceIds = raceIds
-      for (const raceId of raceIds) {
-        await predictRace(raceId)
+      for (let i = 0; i < raceIds.length; i++) {
+        await predictRace(raceIds[i])
         job.completed++
+        if (i < raceIds.length - 1) await jitteredSleep(...BETWEEN_RACES_INTERVAL_MS)
       }
       job.status = 'done'
     } catch (err) {

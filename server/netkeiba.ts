@@ -20,7 +20,13 @@ async function fetchHtml(url: string, params?: Record<string, string>) {
   return iconv.decode(buf, 'euc-jp')
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+// 固定間隔だと機械的なアクセスに見えやすいため、範囲内でランダムな待機時間にする
+function jitteredSleep(minMs: number, maxMs: number): Promise<void> {
+  const ms = minMs + Math.random() * (maxMs - minMs)
+  return sleep(ms)
+}
 
 export type RaceCardHorse = {
   horseId: string
@@ -386,10 +392,10 @@ export async function discoverUpcomingRaceIds(
       if (raceIds.length >= targetCount) break
     }
 
-    if (dayOffset < maxDaysAhead - 1) await sleep(300)
+    if (dayOffset < maxDaysAhead - 1) await jitteredSleep(300, 700)
   }
 
   return raceIds.slice(0, targetCount)
 }
 
-export { sleep }
+export { sleep, jitteredSleep }

@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3'
 import path from 'node:path'
-import type { RaceCard } from './netkeiba'
+import type { RaceCard, PastRace, Pedigree } from './netkeiba'
 import type { RaceResult } from './netkeiba'
 import type { HorsePrediction, BetSuggestions } from './predict'
 
@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS bets (
 );
 CREATE INDEX IF NOT EXISTS idx_bets_race ON bets(race_id);
 CREATE INDEX IF NOT EXISTS idx_bets_type ON bets(bet_type);
+
+-- netkeibaへの重複アクセスを避けるための馬ごとのキャッシュ。
+-- 血統は不変なので無期限、過去成績はTTL付き(呼び出し側で判定)で使う。
+CREATE TABLE IF NOT EXISTS horse_cache (
+  horse_id TEXT PRIMARY KEY,
+  pedigree_json TEXT NOT NULL,
+  pedigree_fetched_at TEXT NOT NULL,
+  history_json TEXT NOT NULL,
+  history_fetched_at TEXT NOT NULL
+);
 `)
 
 // 既存DBファイルに新しいカラムを後から追加するための簡易マイグレーション
@@ -204,6 +214,47 @@ export function saveRaceResult(raceId: string, result: RaceResult): { confirmed:
   })
   tx()
   return { confirmed: true }
+}
+
+export type CachedHorse = {
+  pedigree: Pedigree
+  pedigreeFetchedAt: string
+  history: PastRace[]
+  historyFetchedAt: string
+}
+
+export function getCachedHorse(horseId: string): CachedHorse | null {
+  const row = db.prepare('SELECT * FROM horse_cache WHERE horse_id = ?').get(horseId) as
+    | {
+        pedigree_json: string
+        pedigree_fetched_at: string
+        history_json: string
+        history_fetched_at: string
+      }
+    | undefined
+  if (!row) return null
+  return {
+    pedigree: JSON.parse(row.pedigree_json),
+    pedigreeFetchedAt: row.pedigree_fetched_at,
+    history: JSON.parse(row.history_json),
+    historyFetchedAt: row.history_fetched_at,
+  }
+}
+
+export function saveCachedHorse(horseId: string, pedigree: Pedigree, history: PastRace[]): void {
+  const now = new Date().toISOString()
+  db.prepare(
+    `INSERT INTO horse_cache (horse_id, pedigree_json, pedigree_fetched_at, history_json, history_fetched_at)
+     VALUES (@horseId, @pedigreeJson, @now, @historyJson, @now)
+     ON CONFLICT(horse_id) DO UPDATE SET
+       pedigree_json=excluded.pedigree_json, pedigree_fetched_at=excluded.pedigree_fetched_at,
+       history_json=excluded.history_json, history_fetched_at=excluded.history_fetched_at`,
+  ).run({
+    horseId,
+    pedigreeJson: JSON.stringify(pedigree),
+    historyJson: JSON.stringify(history),
+    now,
+  })
 }
 
 export function getHistory() {
