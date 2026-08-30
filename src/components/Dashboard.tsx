@@ -13,10 +13,18 @@ type RecentPick = {
   raceId: string
   raceName: string
   course: string
+  venue: string
+  raceDate: string
   predictedAt: string
   confidence: string | null
   probabilityGap: number | null
   betsByType: Record<string, RecentPickCombo[]>
+}
+
+function formatRaceDate(dateStr: string) {
+  if (!dateStr) return ''
+  const d = new Date(`${dateStr}T00:00:00`)
+  return d.toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })
 }
 
 type BatchJob = {
@@ -137,13 +145,18 @@ function RecentPicksSection() {
             {picks.map((p) => (
               <div className="col-md-6" key={p.raceId}>
                 <div className="border rounded p-3 h-100">
-                  <div className="d-flex align-items-center gap-2 mb-2">
+                  <div className="d-flex align-items-center gap-2 mb-1 flex-wrap">
                     <span className="fw-semibold small">{p.raceName || p.raceId}</span>
                     {p.confidence && (
                       <span className={`badge ${confidenceBadgeClass(p.confidence)}`}>{p.confidence}</span>
                     )}
                   </div>
-                  <div className="text-muted small mb-2">{p.course}</div>
+                  <div className="text-muted small mb-2">
+                    {formatRaceDate(p.raceDate)}
+                    {p.venue && ` ${p.venue}`}
+                    {' ・ '}
+                    {p.course}
+                  </div>
                   {BET_TYPE_ORDER.filter((t) => p.betsByType[t]?.length).map((t) => (
                     <div key={t} className="small mb-1">
                       <span className="text-muted me-1">{BET_TYPE_LABELS[t]}:</span>

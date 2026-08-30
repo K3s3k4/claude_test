@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS races (
   confirmed_at TEXT,
   confidence TEXT,
   probability_gap REAL,
-  box_size INTEGER
+  box_size INTEGER,
+  venue TEXT,
+  race_date TEXT
 );
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -71,6 +73,8 @@ function ensureColumn(table: string, column: string, declaration: string): void 
 ensureColumn('races', 'confidence', 'TEXT')
 ensureColumn('races', 'probability_gap', 'REAL')
 ensureColumn('races', 'box_size', 'INTEGER')
+ensureColumn('races', 'venue', 'TEXT')
+ensureColumn('races', 'race_date', 'TEXT')
 
 // 着順を問わない券種(馬連/ワイド/三連複)は昇順に正規化し、
 // 着順固定の券種(馬単/三連単)は推定順のまま比較キーにする
@@ -92,13 +96,14 @@ export function saveRacePrediction(
 
   const upsertRace = db.prepare(`
     INSERT INTO races (race_id, race_name, course, distance, surface, track_condition, predicted_at,
-                        confidence, probability_gap, box_size)
+                        confidence, probability_gap, box_size, venue, race_date)
     VALUES (@raceId, @raceName, @course, @distance, @surface, @trackCondition, @predictedAt,
-            @confidence, @probabilityGap, @boxSize)
+            @confidence, @probabilityGap, @boxSize, @venue, @raceDate)
     ON CONFLICT(race_id) DO UPDATE SET
       race_name=excluded.race_name, course=excluded.course, distance=excluded.distance,
       surface=excluded.surface, track_condition=excluded.track_condition, predicted_at=excluded.predicted_at,
-      confidence=excluded.confidence, probability_gap=excluded.probability_gap, box_size=excluded.box_size
+      confidence=excluded.confidence, probability_gap=excluded.probability_gap, box_size=excluded.box_size,
+      venue=excluded.venue, race_date=excluded.race_date
   `)
 
   const deletePredictions = db.prepare('DELETE FROM predictions WHERE race_id = ?')
@@ -124,6 +129,8 @@ export function saveRacePrediction(
       confidence: bets?.confidence ?? null,
       probabilityGap: bets?.probabilityGap ?? null,
       boxSize: bets?.boxSize ?? null,
+      venue: race.venue,
+      raceDate: race.date,
     })
     deletePredictions.run(race.raceId)
     deleteBets.run(race.raceId)
@@ -260,8 +267,8 @@ export function saveCachedHorse(horseId: string, pedigree: Pedigree, history: Pa
 export function getHistory() {
   return db
     .prepare(
-      `SELECT race_id as raceId, race_name as raceName, course, predicted_at as predictedAt,
-              confirmed_at as confirmedAt, confidence
+      `SELECT race_id as raceId, race_name as raceName, course, venue, race_date as raceDate,
+              predicted_at as predictedAt, confirmed_at as confirmedAt, confidence
        FROM races ORDER BY predicted_at DESC LIMIT 100`,
     )
     .all()
@@ -272,6 +279,8 @@ export type RecentPick = {
   raceId: string
   raceName: string
   course: string
+  venue: string
+  raceDate: string
   predictedAt: string
   confidence: string | null
   probabilityGap: number | null
@@ -282,14 +291,16 @@ export type RecentPick = {
 export function getRecentPicks(limit = 4): RecentPick[] {
   const races = db
     .prepare(
-      `SELECT race_id as raceId, race_name as raceName, course, predicted_at as predictedAt,
-              confidence, probability_gap as probabilityGap
+      `SELECT race_id as raceId, race_name as raceName, course, venue, race_date as raceDate,
+              predicted_at as predictedAt, confidence, probability_gap as probabilityGap
        FROM races ORDER BY predicted_at DESC LIMIT ?`,
     )
     .all(limit) as {
     raceId: string
     raceName: string
     course: string
+    venue: string
+    raceDate: string
     predictedAt: string
     confidence: string | null
     probabilityGap: number | null

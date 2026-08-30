@@ -65,7 +65,15 @@ type RaceCard = {
   distance: number
   surface: 'turf' | 'dirt' | 'unknown'
   trackCondition: string
+  venue: string
+  date: string
   horses: RaceCardHorse[]
+}
+
+function formatRaceDate(dateStr: string) {
+  if (!dateStr) return ''
+  const d = new Date(`${dateStr}T00:00:00`)
+  return d.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' })
 }
 
 type Pick = { umaban: number; name: string }
@@ -289,7 +297,12 @@ function Prediction() {
           <div className="card border-0 shadow-sm mb-3">
             <div className="card-body">
               <h2 className="h5 fw-bold mb-1">{data.race.raceName || `race_id: ${data.race.raceId}`}</h2>
-              <div className="text-muted small">{data.race.course}</div>
+              <div className="text-muted small">
+                {formatRaceDate(data.race.date)}
+                {data.race.venue && ` ${data.race.venue}`}
+                {' ・ '}
+                {data.race.course}
+              </div>
             </div>
           </div>
 

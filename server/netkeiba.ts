@@ -50,6 +50,8 @@ export type RaceCard = {
   distance: number
   surface: 'turf' | 'dirt' | 'unknown'
   trackCondition: string
+  venue: string // 開催会場 (例: 札幌, 中山)
+  date: string // 開催日 (YYYY-MM-DD)
   horses: RaceCardHorse[]
 }
 
@@ -68,6 +70,15 @@ export async function fetchRaceCard(raceId: string): Promise<RaceCard> {
       : 'unknown'
   const conditionMatch = raceData01.match(/馬場:(\S+)/)
   const trackCondition = conditionMatch ? conditionMatch[1] : ''
+
+  // RaceData02は「2回」「札幌」「1日目」...という順のspan列で、会場名は2番目
+  const raceData02Spans = $('.RaceData02').first().find('span').map((_, el) => $(el).text().trim()).get()
+  const venue = raceData02Spans[1] || ''
+
+  // 払戻一覧へのリンクに kaisai_date=YYYYMMDD が含まれている
+  const refundHref = $('.Refundlink a, a.LinkMore').first().attr('href') || ''
+  const dateMatch = refundHref.match(/kaisai_date=(\d{4})(\d{2})(\d{2})/)
+  const date = dateMatch ? `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}` : ''
 
   const horses: RaceCardHorse[] = []
   $('tr.HorseList').each((_, el) => {
@@ -106,7 +117,7 @@ export async function fetchRaceCard(raceId: string): Promise<RaceCard> {
     })
   })
 
-  return { raceId, raceName, course: raceData01, distance, surface, trackCondition, horses }
+  return { raceId, raceName, course: raceData01, distance, surface, trackCondition, venue, date, horses }
 }
 
 export type PastRace = {

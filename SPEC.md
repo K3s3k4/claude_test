@@ -83,6 +83,8 @@ race: {
   raceId, raceName, course, distance,
   surface: 'turf' | 'dirt' | 'unknown',
   trackCondition,           // 例: "良" "稍重" "重" "不良"
+  venue,                    // 開催会場 (例: "札幌")
+  date,                     // 開催日 (YYYY-MM-DD)
   horses: RaceCardHorse[]
 }
 
@@ -108,7 +110,8 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 
 ### `GET /api/history`
 
-保存済みの予想レース一覧（最新100件）を返す。`{ races: [{ raceId, raceName, course, predictedAt, confirmedAt, confidence }] }`
+保存済みの予想レース一覧（最新100件）を返す。
+`{ races: [{ raceId, raceName, course, venue, raceDate, predictedAt, confirmedAt, confidence }] }`
 
 ### `GET /api/stats`
 
@@ -122,7 +125,7 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 ### `GET /api/dashboard/recent-picks?limit=4`
 
 直近に予想したレース最大`limit`件について、券種別の買い目（馬名・確率つき）を返す。
-`{ picks: [{ raceId, raceName, course, predictedAt, confidence, probabilityGap, betsByType }] }`
+`{ picks: [{ raceId, raceName, course, venue, raceDate, predictedAt, confidence, probabilityGap, betsByType }] }`
 
 ### `POST /api/batch-predict`
 
@@ -145,7 +148,7 @@ bets: BetSuggestions | null       // 出走3頭未満の場合はnull
 
 | 関数 | 取得元URL | 内容 |
 |---|---|---|
-| `fetchRaceCard` | `race.netkeiba.com/race/shutuba.html?race_id=` | 出走馬一覧・枠番・馬番・斤量・騎手・厩舎・馬体重・オッズ・人気 |
+| `fetchRaceCard` | `race.netkeiba.com/race/shutuba.html?race_id=` | 出走馬一覧・枠番・馬番・斤量・騎手・厩舎・馬体重・オッズ・人気・開催会場・開催日 |
 | `fetchHorseHistory` | `db.netkeiba.com/horse/result/{horseId}/` | 過去全レースの日付・開催・距離・馬場状態・着順・人気・騎手・タイム・通過順位・上がり3F |
 | `fetchPedigree` | `db.netkeiba.com/horse/ped/{horseId}/` | 5代血統表HTMLを`rowspan`展開して3世代（父母・祖父母4頭・曾祖父母8頭、計14頭）を復元 |
 | `fetchRaceResult` | `race.netkeiba.com/race/result.html?race_id=` | 確定着順・単勝〜三連単の払戻金額を取得。結果未確定の場合は`null`を返す |
@@ -236,7 +239,7 @@ SQLite（`better-sqlite3`、ファイル: `data/predictions.db`）に予想・�
 
 | テーブル | 内容 |
 |---|---|
-| `races` | レース基本情報、予想日時(`predicted_at`)、結果確定日時(`confirmed_at`、未確定は`NULL`)、信頼度(`confidence`/`probability_gap`/`box_size`) |
+| `races` | レース基本情報（開催会場`venue`・開催日`race_date`含む）、予想日時(`predicted_at`)、結果確定日時(`confirmed_at`、未確定は`NULL`)、信頼度(`confidence`/`probability_gap`/`box_size`) |
 | `predictions` | レースごとの各馬の予想（スコア・推定勝率・推定複勝率・着順）。結果確定前は`finish_position`が`NULL` |
 | `bets` | 推奨買い目1組ごとの券種・馬番の組み合わせ・推定確率・的中可否(`hit`)・払戻金額(`payout`)。結果確定前は`hit`/`payout`が`NULL` |
 | `horse_cache` | 馬ごとの血統・過去成績のキャッシュ（5.1節参照）。netkeibaへの重複アクセスを避ける目的 |

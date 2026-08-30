@@ -4,6 +4,8 @@ type RaceHistoryRow = {
   raceId: string
   raceName: string
   course: string
+  venue: string
+  raceDate: string
   predictedAt: string
   confirmedAt: string | null
 }
@@ -32,6 +34,12 @@ const BET_TYPE_ORDER = ['tansho', 'fukusho', 'umaren', 'wide', 'umatan', 'sanren
 function formatDateTime(iso: string) {
   const d = new Date(iso)
   return d.toLocaleString('ja-JP', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function formatRaceDate(dateStr: string) {
+  if (!dateStr) return ''
+  const d = new Date(`${dateStr}T00:00:00`)
+  return d.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' })
 }
 
 function History() {
@@ -141,6 +149,7 @@ function History() {
                 <thead>
                   <tr>
                     <th>レース</th>
+                    <th>開催日・会場</th>
                     <th>予想日時</th>
                     <th>状態</th>
                     <th />
@@ -152,6 +161,10 @@ function History() {
                       <td>
                         <div className="fw-semibold">{r.raceName || r.raceId}</div>
                         <div className="text-muted small">{r.course}</div>
+                      </td>
+                      <td className="text-muted small">
+                        {formatRaceDate(r.raceDate)}
+                        {r.venue && ` ${r.venue}`}
                       </td>
                       <td className="text-muted small">{formatDateTime(r.predictedAt)}</td>
                       <td>
