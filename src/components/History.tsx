@@ -17,6 +17,7 @@ type RaceDetailBet = {
   probability: number
   hit: boolean | null
   payout: number | null
+  stakeYen: number
 }
 type RaceDetail = {
   raceId: string
@@ -28,7 +29,7 @@ type RaceDetail = {
   confirmedAt: string | null
   finishOrder: RaceDetailFinisher[]
   betsByType: Record<string, RaceDetailBet[]>
-  totalAttempts: number
+  totalStakeYen: number
   totalPayout: number
   returnRate: number | null
 }
@@ -38,6 +39,7 @@ type BetTypeStats = {
   attempts: number
   hits: number
   hitRate: number
+  totalStakeYen: number
   totalPayout: number
   returnRate: number
 }
@@ -166,7 +168,9 @@ function RaceDetailPanel({ detail }: { detail: RaceDetail }) {
           <span className={`badge ${detail.returnRate >= 100 ? 'bg-success' : 'bg-danger'}`}>{detail.returnRate}%</span>
         )}
         {detail.confirmedAt && (
-          <span className="text-muted small">(買い目 {detail.totalAttempts}点 ・ 払戻合計 {detail.totalPayout}円)</span>
+          <span className="text-muted small">
+            (購入額 {detail.totalStakeYen.toLocaleString()}円 ・ 払戻合計 {detail.totalPayout.toLocaleString()}円)
+          </span>
         )}
       </div>
 
@@ -193,31 +197,36 @@ function RaceDetailPanel({ detail }: { detail: RaceDetail }) {
                 <th>券種</th>
                 <th>買い目</th>
                 <th>予想確率</th>
+                <th>購入額</th>
                 <th>結果</th>
                 <th>払戻</th>
               </tr>
             </thead>
             <tbody>
               {BET_TYPE_ORDER.filter((t) => detail.betsByType[t]?.length).map((t) =>
-                detail.betsByType[t].map((b) => (
-                  <tr key={`${t}-${b.umabanCombo}`}>
-                    <td className="text-muted small">{BET_TYPE_LABELS[t]}</td>
-                    <td className="small">
-                      {b.umabanCombo} <span className="text-muted">({b.names})</span>
-                    </td>
-                    <td className="small">{(b.probability * 100).toFixed(1)}%</td>
-                    <td>
-                      {b.hit == null ? (
-                        <span className="text-muted small">-</span>
-                      ) : b.hit ? (
-                        <span className="badge bg-success">的中</span>
-                      ) : (
-                        <span className="badge bg-secondary-subtle text-secondary-emphasis">不的中</span>
-                      )}
-                    </td>
-                    <td className="small">{b.payout ? `${b.payout}円` : '-'}</td>
-                  </tr>
-                )),
+                detail.betsByType[t].map((b) => {
+                  const returnYen = b.hit && b.payout != null ? Math.round((b.stakeYen / 100) * b.payout) : 0
+                  return (
+                    <tr key={`${t}-${b.umabanCombo}`}>
+                      <td className="text-muted small">{BET_TYPE_LABELS[t]}</td>
+                      <td className="small">
+                        {b.umabanCombo} <span className="text-muted">({b.names})</span>
+                      </td>
+                      <td className="small">{(b.probability * 100).toFixed(1)}%</td>
+                      <td className="small">{b.stakeYen.toLocaleString()}円</td>
+                      <td>
+                        {b.hit == null ? (
+                          <span className="text-muted small">-</span>
+                        ) : b.hit ? (
+                          <span className="badge bg-success">的中</span>
+                        ) : (
+                          <span className="badge bg-secondary-subtle text-secondary-emphasis">不的中</span>
+                        )}
+                      </td>
+                      <td className="small">{returnYen > 0 ? `${returnYen.toLocaleString()}円` : '-'}</td>
+                    </tr>
+                  )
+                }),
               )}
             </tbody>
           </table>
@@ -321,7 +330,9 @@ function History() {
                     <th>試行数</th>
                     <th>的中数</th>
                     <th>的中率</th>
-                    <th>回収率(100円/点換算)</th>
+                    <th>購入額</th>
+                    <th>払戻額</th>
+                    <th>回収率</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -333,7 +344,9 @@ function History() {
                         <td>{s.attempts}</td>
                         <td>{s.hits}</td>
                         <td className="fw-semibold">{s.hitRate}%</td>
-                        <td className={s.returnRate >= 100 ? 'text-success fw-semibold' : ''}>{s.returnRate}%</td>
+                        <td className="text-muted">{s.totalStakeYen.toLocaleString()}円</td>
+                        <td className="text-muted">{s.totalPayout.toLocaleString()}円</td>
+                        <td className={s.returnRate >= 100 ? 'text-success fw-semibold' : 'fw-semibold'}>{s.returnRate}%</td>
                       </tr>
                     )
                   })}
@@ -343,7 +356,7 @@ function History() {
           )}
           <p className="text-muted small mb-0 mt-2">
             <i className="bi bi-info-circle me-1" />
-            試行数は推奨買い目1組(1点)ごとにカウントしています。回収率は1点あたり100円で購入した想定の参考値です。
+            購入額は/predictと同じ予算配分ロジック(1レース3,000円を券種に均等配分し、券種内は推定確率に比例して100円単位で配分)で、レースごとに実際に賭けたであろう金額を再現し積み上げたものです。回収率は購入額に対する払戻額の割合です。
           </p>
         </div>
       </div>

@@ -4,6 +4,7 @@ import type { RaceCard, PastRace, Pedigree } from './netkeiba'
 import type { RaceResult } from './netkeiba'
 import type { HorsePrediction, BetSuggestions, PredictionBreakdown, RunningStyle } from './predict'
 import { confidenceScore, describeAxisPick } from './predict'
+import { allocateRaceStakes, DEFAULT_BUDGET_YEN } from './stake'
 
 const DB_PATH = path.join(import.meta.dirname, '..', 'data', 'predictions.db')
 
@@ -416,7 +417,8 @@ export type RaceDetailBet = {
   names: string
   probability: number
   hit: boolean | null // null = 結果未確定
-  payout: number | null
+  payout: number | null // 100円/口あたりの払戻額(netkeiba発表値)
+  stakeYen: number // このレースの予算(DEFAULT_BUDGET_YEN)を券種均等×確率比例で配分した想定購入額
 }
 export type RaceDetail = {
   raceId: string
@@ -428,12 +430,14 @@ export type RaceDetail = {
   confirmedAt: string | null
   finishOrder: RaceDetailFinisher[]
   betsByType: Record<string, RaceDetailBet[]>
-  totalAttempts: number
-  totalPayout: number
-  returnRate: number | null // 結果未確定なら null
+  totalStakeYen: number
+  totalPayout: number // 払戻合計(円)
+  returnRate: number | null // 金額ベースの回収率(%)。結果未確定なら null
 }
 
-// 予想履歴の1レース分の詳細(買い目・実際の着順・的中結果)を返す
+// 予想履歴の1レース分の詳細(買い目・実際の着順・的中結果)を返す。
+// 回収率は /predict と同じ予算配分ロジック(券種に均等配分→券種内は確率比例、100円単位)で
+// 実際に賭けたであろう金額をもとに計算する(100円均等ではない)。
 export function getRaceDetail(raceId: string): RaceDetail | null {
   const race = db
     .prepare(
@@ -474,39 +478,110 @@ export function getRaceDetail(raceId: string): RaceDetail | null {
     )
     .all(raceId) as { betType: string; umabanCombo: string; probability: number; hit: number | null; payout: number | null }[]
 
-  const betsByType: Record<string, RaceDetailBet[]> = {}
-  let totalAttempts = 0
-  let totalPayout = 0
+  const grouped: Record<string, typeof bets> = {}
   for (const b of bets) {
-    const names = b.umabanCombo
-      .split(',')
-      .map((u) => nameByUmaban.get(Number(u)) ?? u)
-      .join(' - ')
-    if (!betsByType[b.betType]) betsByType[b.betType] = []
-    betsByType[b.betType].push({
-      umabanCombo: b.umabanCombo,
-      names,
-      probability: b.probability,
-      hit: b.hit == null ? null : !!b.hit,
-      payout: b.payout,
-    })
-    if (race.confirmedAt) {
-      totalAttempts += 1
-      totalPayout += b.payout ?? 0
-    }
+    if (!grouped[b.betType]) grouped[b.betType] = []
+    grouped[b.betType].push(b)
   }
-  for (const type of Object.keys(betsByType)) {
-    betsByType[type].sort((a, b) => b.probability - a.probability)
+  const stakesByType = allocateRaceStakes(
+    Object.fromEntries(Object.entries(grouped).map(([t, arr]) => [t, arr.map((b) => ({ probability: b.probability }))])),
+  )
+
+  const betsByType: Record<string, RaceDetailBet[]> = {}
+  let totalStakeYen = 0
+  let totalPayout = 0
+  for (const [betType, arr] of Object.entries(grouped)) {
+    const stakes = stakesByType[betType] ?? arr.map(() => 0)
+    betsByType[betType] = arr.map((b, i) => {
+      const names = b.umabanCombo
+        .split(',')
+        .map((u) => nameByUmaban.get(Number(u)) ?? u)
+        .join(' - ')
+      const stakeYen = stakes[i] ?? 0
+      if (race.confirmedAt) {
+        totalStakeYen += stakeYen
+        if (b.hit) totalPayout += Math.round((stakeYen / 100) * (b.payout ?? 0))
+      }
+      return {
+        umabanCombo: b.umabanCombo,
+        names,
+        probability: b.probability,
+        hit: b.hit == null ? null : !!b.hit,
+        payout: b.payout,
+        stakeYen,
+      }
+    })
+    betsByType[betType].sort((a, b) => b.probability - a.probability)
   }
 
   return {
     ...race,
     finishOrder,
     betsByType,
-    totalAttempts,
+    totalStakeYen,
     totalPayout,
-    returnRate: race.confirmedAt && totalAttempts > 0 ? Math.round((totalPayout / (totalAttempts * 100)) * 1000) / 10 : null,
+    returnRate: race.confirmedAt && totalStakeYen > 0 ? Math.round((totalPayout / totalStakeYen) * 1000) / 10 : null,
   }
+}
+
+// 結果確定済みの全レースについて、/predict と同じ予算配分ロジックで
+// 券種ごとの想定購入額・払戻額を計算する。getStats/getStatsByPeriod共通の下請け関数。
+function computeConfirmedRaceMoneyStats(budget: number = DEFAULT_BUDGET_YEN) {
+  const races = db
+    .prepare(
+      `SELECT race_id as raceId, COALESCE(race_date, substr(confirmed_at, 1, 10)) as day
+       FROM races WHERE confirmed_at IS NOT NULL`,
+    )
+    .all() as { raceId: string; day: string }[]
+  if (races.length === 0) return []
+
+  const raceIds = races.map((r) => r.raceId)
+  const placeholders = raceIds.map(() => '?').join(',')
+  const allBets = db
+    .prepare(
+      `SELECT race_id as raceId, bet_type as betType, probability, hit, payout
+       FROM bets WHERE race_id IN (${placeholders})`,
+    )
+    .all(...raceIds) as { raceId: string; betType: string; probability: number; hit: number | null; payout: number | null }[]
+
+  const betsByRace = new Map<string, typeof allBets>()
+  for (const b of allBets) {
+    if (!betsByRace.has(b.raceId)) betsByRace.set(b.raceId, [])
+    betsByRace.get(b.raceId)!.push(b)
+  }
+
+  return races.map((r) => {
+    const bets = betsByRace.get(r.raceId) ?? []
+    const grouped: Record<string, typeof bets> = {}
+    for (const b of bets) {
+      if (!grouped[b.betType]) grouped[b.betType] = []
+      grouped[b.betType].push(b)
+    }
+    const stakesByType = allocateRaceStakes(
+      Object.fromEntries(Object.entries(grouped).map(([t, arr]) => [t, arr.map((b) => ({ probability: b.probability }))])),
+      budget,
+    )
+
+    const byType: Record<string, { attempts: number; hits: number; stake: number; returnYen: number }> = {}
+    for (const [t, arr] of Object.entries(grouped)) {
+      const stakes = stakesByType[t] ?? arr.map(() => 0)
+      let attempts = 0
+      let hits = 0
+      let stake = 0
+      let returnYen = 0
+      arr.forEach((b, i) => {
+        attempts += 1
+        const s = stakes[i] ?? 0
+        stake += s
+        if (b.hit) {
+          hits += 1
+          returnYen += Math.round((s / 100) * (b.payout ?? 0))
+        }
+      })
+      byType[t] = { attempts, hits, stake, returnYen }
+    }
+    return { raceId: r.raceId, period: r.day, byType }
+  })
 }
 
 export type BetTypeStats = {
@@ -514,31 +589,33 @@ export type BetTypeStats = {
   attempts: number
   hits: number
   hitRate: number
+  totalStakeYen: number
   totalPayout: number
-  returnRate: number // totalPayout / (attempts * 100点単位) * 100(%)
+  returnRate: number // totalPayout / totalStakeYen * 100(%)。予算配分ベースの金額回収率
 }
 
 export function getStats(): BetTypeStats[] {
-  const rows = db
-    .prepare(
-      `SELECT b.bet_type as betType,
-              COUNT(*) as attempts,
-              SUM(CASE WHEN b.hit = 1 THEN 1 ELSE 0 END) as hits,
-              SUM(COALESCE(b.payout, 0)) as totalPayout
-       FROM bets b
-       JOIN races r ON r.race_id = b.race_id
-       WHERE r.confirmed_at IS NOT NULL
-       GROUP BY b.bet_type`,
-    )
-    .all() as { betType: string; attempts: number; hits: number; totalPayout: number }[]
+  const perRace = computeConfirmedRaceMoneyStats()
+  const agg = new Map<string, { attempts: number; hits: number; stake: number; returnYen: number }>()
+  for (const race of perRace) {
+    for (const [t, v] of Object.entries(race.byType)) {
+      const cur = agg.get(t) ?? { attempts: 0, hits: 0, stake: 0, returnYen: 0 }
+      cur.attempts += v.attempts
+      cur.hits += v.hits
+      cur.stake += v.stake
+      cur.returnYen += v.returnYen
+      agg.set(t, cur)
+    }
+  }
 
-  return rows.map((r) => ({
-    betType: r.betType,
-    attempts: r.attempts,
-    hits: r.hits,
-    hitRate: r.attempts > 0 ? Math.round((r.hits / r.attempts) * 1000) / 10 : 0,
-    totalPayout: r.totalPayout,
-    returnRate: r.attempts > 0 ? Math.round((r.totalPayout / (r.attempts * 100)) * 1000) / 10 : 0,
+  return [...agg.entries()].map(([betType, v]) => ({
+    betType,
+    attempts: v.attempts,
+    hits: v.hits,
+    hitRate: v.attempts > 0 ? Math.round((v.hits / v.attempts) * 1000) / 10 : 0,
+    totalStakeYen: v.stake,
+    totalPayout: v.returnYen,
+    returnRate: v.stake > 0 ? Math.round((v.returnYen / v.stake) * 1000) / 10 : 0,
   }))
 }
 
@@ -546,44 +623,44 @@ export type StatsPeriodPoint = {
   period: string // 'day' なら YYYY-MM-DD、'month' なら YYYY-MM
   attempts: number
   hits: number
+  totalStakeYen: number
   totalPayout: number
-  returnRate: number // 当該期間単体の回収率(%)
-  cumulativeReturnRate: number // 集計開始からの累積回収率(%)
+  returnRate: number // 当該期間単体の金額回収率(%)
+  cumulativeReturnRate: number // 集計開始からの累積金額回収率(%)
 }
 
 // ダッシュボードの回収率推移グラフ用。race_date が無い古いレコードは confirmed_at の日付で代用する。
+// /predict と同じ予算配分ロジックで実際に賭けたであろう金額をもとに回収率を計算する。
 export function getStatsByPeriod(granularity: 'day' | 'month'): StatsPeriodPoint[] {
-  const periodExpr =
-    granularity === 'month'
-      ? "substr(COALESCE(r.race_date, substr(r.confirmed_at, 1, 10)), 1, 7)"
-      : "COALESCE(r.race_date, substr(r.confirmed_at, 1, 10))"
+  const perRace = computeConfirmedRaceMoneyStats()
+  const bucket = new Map<string, { attempts: number; hits: number; stake: number; returnYen: number }>()
+  for (const race of perRace) {
+    const period = granularity === 'month' ? race.period.slice(0, 7) : race.period
+    const cur = bucket.get(period) ?? { attempts: 0, hits: 0, stake: 0, returnYen: 0 }
+    for (const v of Object.values(race.byType)) {
+      cur.attempts += v.attempts
+      cur.hits += v.hits
+      cur.stake += v.stake
+      cur.returnYen += v.returnYen
+    }
+    bucket.set(period, cur)
+  }
 
-  const rows = db
-    .prepare(
-      `SELECT ${periodExpr} as period,
-              COUNT(*) as attempts,
-              SUM(CASE WHEN b.hit = 1 THEN 1 ELSE 0 END) as hits,
-              SUM(COALESCE(b.payout, 0)) as totalPayout
-       FROM bets b
-       JOIN races r ON r.race_id = b.race_id
-       WHERE r.confirmed_at IS NOT NULL
-       GROUP BY period
-       ORDER BY period ASC`,
-    )
-    .all() as { period: string; attempts: number; hits: number; totalPayout: number }[]
-
-  let cumAttempts = 0
-  let cumPayout = 0
-  return rows.map((r) => {
-    cumAttempts += r.attempts
-    cumPayout += r.totalPayout
+  const sortedPeriods = [...bucket.keys()].sort()
+  let cumStake = 0
+  let cumReturn = 0
+  return sortedPeriods.map((period) => {
+    const v = bucket.get(period)!
+    cumStake += v.stake
+    cumReturn += v.returnYen
     return {
-      period: r.period,
-      attempts: r.attempts,
-      hits: r.hits,
-      totalPayout: r.totalPayout,
-      returnRate: r.attempts > 0 ? Math.round((r.totalPayout / (r.attempts * 100)) * 1000) / 10 : 0,
-      cumulativeReturnRate: cumAttempts > 0 ? Math.round((cumPayout / (cumAttempts * 100)) * 1000) / 10 : 0,
+      period,
+      attempts: v.attempts,
+      hits: v.hits,
+      totalStakeYen: v.stake,
+      totalPayout: v.returnYen,
+      returnRate: v.stake > 0 ? Math.round((v.returnYen / v.stake) * 1000) / 10 : 0,
+      cumulativeReturnRate: cumStake > 0 ? Math.round((cumReturn / cumStake) * 1000) / 10 : 0,
     }
   })
 }

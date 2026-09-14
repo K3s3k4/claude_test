@@ -288,6 +288,7 @@ type StatsPeriodPoint = {
   period: string
   attempts: number
   hits: number
+  totalStakeYen: number
   totalPayout: number
   returnRate: number
   cumulativeReturnRate: number
@@ -298,6 +299,7 @@ type BetTypeStats = {
   attempts: number
   hits: number
   hitRate: number
+  totalStakeYen: number
   totalPayout: number
   returnRate: number
 }
