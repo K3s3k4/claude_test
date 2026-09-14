@@ -1,46 +1,33 @@
 import { NavLink } from 'react-router-dom'
 
-// メニュー項目は仮の内容。後で差し替える想定。
-const NAV_ITEMS = [
-  { to: '/', label: 'ダッシュボード' },
-  { to: '/predict', label: '競馬予想' },
-  { to: '/history', label: '予想履歴' },
+export const NAV_ITEMS = [
+  { to: '/', label: 'ダッシュボード', icon: 'bi-speedometer2' },
+  { to: '/predict', label: '競馬予想', icon: 'bi-search' },
+  { to: '/history', label: '予想履歴', icon: 'bi-clock-history' },
 ]
 
 function AppNavbar() {
   return (
-    <nav className="navbar navbar-expand-lg navbar-dark bg-dark sticky-top shadow-sm">
+    <nav className="navbar navbar-dark app-navbar sticky-top shadow-sm">
       <div className="container">
-        <NavLink className="navbar-brand fw-semibold" to="/">
-          <i className="bi bi-lightning-charge-fill me-2" />
-          MyApp
+        <NavLink className="navbar-brand fw-semibold app-brand mb-0" to="/">
+          <i className="bi bi-compass-fill me-2" />
+          回収の羅針盤
         </NavLink>
-        <button
-          className="navbar-toggler"
-          type="button"
-          data-bs-toggle="collapse"
-          data-bs-target="#navbarContent"
-          aria-controls="navbarContent"
-          aria-expanded="false"
-          aria-label="Toggle navigation"
-        >
-          <span className="navbar-toggler-icon" />
-        </button>
-        <div className="collapse navbar-collapse" id="navbarContent">
-          <ul className="navbar-nav ms-auto mb-2 mb-lg-0">
-            {NAV_ITEMS.map((item) => (
-              <li className="nav-item" key={item.to}>
-                <NavLink
-                  className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
-                  to={item.to}
-                  end={item.to === '/'}
-                >
-                  {item.label}
-                </NavLink>
-              </li>
-            ))}
-          </ul>
-        </div>
+        <ul className="navbar-nav flex-row gap-1 d-none d-md-flex">
+          {NAV_ITEMS.map((item) => (
+            <li className="nav-item" key={item.to}>
+              <NavLink
+                className={({ isActive }) => `nav-link px-3 ${isActive ? 'active' : ''}`}
+                to={item.to}
+                end={item.to === '/'}
+              >
+                <i className={`bi ${item.icon} me-1`} />
+                {item.label}
+              </NavLink>
+            </li>
+          ))}
+        </ul>
       </div>
     </nav>
   )
