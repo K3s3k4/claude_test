@@ -5,14 +5,31 @@ import iconv from 'iconv-lite'
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
 
+// netkeibaが一時的にアクセス制限をかけた際、全リクエストがHTTP 400を返すことを確認済み。
+// 通常のスクレイピング失敗(セレクタ不一致など)と区別するための専用エラー型。
+export class NetkeibaBlockedError extends Error {
+  constructor(url: string) {
+    super(`netkeibaからアクセス制限を受けている可能性があります(HTTP 400): ${url}`)
+    this.name = 'NetkeibaBlockedError'
+  }
+}
+
 // netkeibaはEUC-JPで配信されるページが多いため、バイナリ取得してデコードする
 async function fetchHtml(url: string, params?: Record<string, string>) {
-  const res = await axios.get<ArrayBuffer>(url, {
-    params,
-    headers: { 'User-Agent': UA },
-    responseType: 'arraybuffer',
-    timeout: 15000,
-  })
+  let res
+  try {
+    res = await axios.get<ArrayBuffer>(url, {
+      params,
+      headers: { 'User-Agent': UA },
+      responseType: 'arraybuffer',
+      timeout: 15000,
+    })
+  } catch (err) {
+    if (axios.isAxiosError(err) && err.response?.status === 400) {
+      throw new NetkeibaBlockedError(url)
+    }
+    throw err
+  }
   const buf = Buffer.from(res.data)
   // UTF-8として妥当ならそのまま、そうでなければEUC-JPとして解釈する
   const utf8 = buf.toString('utf-8')
@@ -392,7 +409,8 @@ export async function discoverUpcomingRaceIds(
     let html: string
     try {
       html = await fetchHtml('https://race.netkeiba.com/top/race_list_sub.html', { kaisai_date: kaisaiDate })
-    } catch {
+    } catch (err) {
+      if (err instanceof NetkeibaBlockedError) throw err // ブロック時は継続せず即座に中断する
       continue
     }
 
@@ -407,6 +425,36 @@ export async function discoverUpcomingRaceIds(
   }
 
   return raceIds.slice(0, targetCount)
+}
+
+// 過去(結果確定済み)のレースを日付を遡って網羅的に集める。目的は限定的な一括バックフィルのみ。
+export async function discoverPastRaceIds(
+  daysBack: number,
+  endDate: Date = new Date(),
+): Promise<{ raceId: string; kaisaiDate: string }[]> {
+  const results: { raceId: string; kaisaiDate: string }[] = []
+
+  for (let dayOffset = 1; dayOffset <= daysBack; dayOffset++) {
+    const date = new Date(endDate)
+    date.setDate(date.getDate() - dayOffset)
+    const kaisaiDate = toKaisaiDate(date)
+
+    let html: string
+    try {
+      html = await fetchHtml('https://race.netkeiba.com/top/race_list_sub.html', { kaisai_date: kaisaiDate })
+    } catch (err) {
+      if (err instanceof NetkeibaBlockedError) throw err // ブロック時は継続せず即座に中断する
+      continue
+    }
+
+    const matches = [...html.matchAll(/result\.html\?race_id=(\d+)/g)]
+    const idsForDay = [...new Set(matches.map((m) => m[1]))]
+    for (const id of idsForDay) results.push({ raceId: id, kaisaiDate })
+
+    if (dayOffset < daysBack) await jitteredSleep(300, 700)
+  }
+
+  return results
 }
 
 export { sleep, jitteredSleep }

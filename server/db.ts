@@ -2,7 +2,8 @@ import Database from 'better-sqlite3'
 import path from 'node:path'
 import type { RaceCard, PastRace, Pedigree } from './netkeiba'
 import type { RaceResult } from './netkeiba'
-import type { HorsePrediction, BetSuggestions } from './predict'
+import type { HorsePrediction, BetSuggestions, PredictionBreakdown, RunningStyle } from './predict'
+import { confidenceScore, describeAxisPick } from './predict'
 
 const DB_PATH = path.join(import.meta.dirname, '..', 'data', 'predictions.db')
 
@@ -75,6 +76,7 @@ ensureColumn('races', 'probability_gap', 'REAL')
 ensureColumn('races', 'box_size', 'INTEGER')
 ensureColumn('races', 'venue', 'TEXT')
 ensureColumn('races', 'race_date', 'TEXT')
+ensureColumn('predictions', 'detail_json', 'TEXT')
 
 // 着順を問わない券種(馬連/ワイド/三連複)は昇順に正規化し、
 // 着順固定の券種(馬単/三連単)は推定順のまま比較キーにする
@@ -109,8 +111,8 @@ export function saveRacePrediction(
   const deletePredictions = db.prepare('DELETE FROM predictions WHERE race_id = ?')
   const deleteBets = db.prepare('DELETE FROM bets WHERE race_id = ?')
   const insertPrediction = db.prepare(`
-    INSERT INTO predictions (race_id, horse_id, umaban, name, rank, score, win_probability, place_probability)
-    VALUES (@raceId, @horseId, @umaban, @name, @rank, @score, @winProbability, @placeProbability)
+    INSERT INTO predictions (race_id, horse_id, umaban, name, rank, score, win_probability, place_probability, detail_json)
+    VALUES (@raceId, @horseId, @umaban, @name, @rank, @score, @winProbability, @placeProbability, @detailJson)
   `)
   const insertBet = db.prepare(`
     INSERT INTO bets (race_id, bet_type, umaban_combo, probability)
@@ -145,6 +147,13 @@ export function saveRacePrediction(
         score: p.score,
         winProbability: p.winProbability,
         placeProbability: p.placeProbability,
+        detailJson: JSON.stringify({
+          breakdown: p.breakdown,
+          runningStyle: p.runningStyle,
+          winEv: p.winEv,
+          odds: p.horse.odds,
+          popularity: p.horse.popularity,
+        }),
       })
     }
 
@@ -184,6 +193,14 @@ export function saveRacePrediction(
     }
   })
   tx()
+}
+
+// バックフィルの再実行時、既に結果確定済みのレースをスキップして安全に再開できるようにする
+export function isRaceConfirmed(raceId: string): boolean {
+  const row = db.prepare('SELECT confirmed_at FROM races WHERE race_id = ?').get(raceId) as
+    | { confirmed_at: string | null }
+    | undefined
+  return !!row?.confirmed_at
 }
 
 export function saveRaceResult(raceId: string, result: RaceResult): { confirmed: boolean } {
@@ -275,6 +292,14 @@ export function getHistory() {
 }
 
 export type RecentPickCombo = { umabanCombo: string; names: string; probability: number }
+export type AxisAnalysis = {
+  umaban: number
+  horseName: string
+  winProbability: number
+  runningStyle: RunningStyle
+  breakdown: PredictionBreakdown
+  summary: string
+}
 export type RecentPick = {
   raceId: string
   raceName: string
@@ -284,7 +309,9 @@ export type RecentPick = {
   predictedAt: string
   confidence: string | null
   probabilityGap: number | null
+  confidenceScore: number | null
   betsByType: Record<string, RecentPickCombo[]>
+  axisAnalysis: AxisAnalysis | null
 }
 
 // ダッシュボード表示用: 直近N件の予想レースについて、券種ごとの上位買い目(馬名つき)を返す
@@ -320,14 +347,26 @@ export function getRecentPicks(limit = 4): RecentPick[] {
 
   const predictions = db
     .prepare(
-      `SELECT race_id as raceId, umaban, name
+      `SELECT race_id as raceId, umaban, name, rank, win_probability as winProbability, detail_json as detailJson
        FROM predictions WHERE race_id IN (${placeholders})`,
     )
-    .all(...raceIds) as { raceId: string; umaban: number; name: string }[]
+    .all(...raceIds) as {
+    raceId: string
+    umaban: number
+    name: string
+    rank: number
+    winProbability: number
+    detailJson: string | null
+  }[]
 
   const nameByRaceUmaban = new Map<string, string>()
   for (const p of predictions) {
     nameByRaceUmaban.set(`${p.raceId}:${p.umaban}`, p.name)
+  }
+
+  const axisByRace = new Map<string, (typeof predictions)[number]>()
+  for (const p of predictions) {
+    if (p.rank === 1) axisByRace.set(p.raceId, p)
   }
 
   return races.map((r) => {
@@ -343,8 +382,131 @@ export function getRecentPicks(limit = 4): RecentPick[] {
     for (const type of Object.keys(betsByType)) {
       betsByType[type].sort((a, b) => b.probability - a.probability)
     }
-    return { ...r, betsByType }
+
+    const axisRow = axisByRace.get(r.raceId)
+    let axisAnalysis: AxisAnalysis | null = null
+    if (axisRow?.detailJson) {
+      try {
+        const detail = JSON.parse(axisRow.detailJson) as { breakdown: PredictionBreakdown; runningStyle: RunningStyle }
+        axisAnalysis = {
+          umaban: axisRow.umaban,
+          horseName: axisRow.name,
+          winProbability: axisRow.winProbability,
+          runningStyle: detail.runningStyle,
+          breakdown: detail.breakdown,
+          summary: describeAxisPick(axisRow.name, axisRow.winProbability, detail.runningStyle, detail.breakdown),
+        }
+      } catch {
+        axisAnalysis = null
+      }
+    }
+
+    return {
+      ...r,
+      confidenceScore: r.probabilityGap != null ? confidenceScore(r.probabilityGap) : null,
+      betsByType,
+      axisAnalysis,
+    }
   })
+}
+
+export type RaceDetailFinisher = { umaban: number; name: string; finishPosition: number | null }
+export type RaceDetailBet = {
+  umabanCombo: string
+  names: string
+  probability: number
+  hit: boolean | null // null = 結果未確定
+  payout: number | null
+}
+export type RaceDetail = {
+  raceId: string
+  raceName: string
+  course: string
+  venue: string
+  raceDate: string
+  predictedAt: string
+  confirmedAt: string | null
+  finishOrder: RaceDetailFinisher[]
+  betsByType: Record<string, RaceDetailBet[]>
+  totalAttempts: number
+  totalPayout: number
+  returnRate: number | null // 結果未確定なら null
+}
+
+// 予想履歴の1レース分の詳細(買い目・実際の着順・的中結果)を返す
+export function getRaceDetail(raceId: string): RaceDetail | null {
+  const race = db
+    .prepare(
+      `SELECT race_id as raceId, race_name as raceName, course, venue, race_date as raceDate,
+              predicted_at as predictedAt, confirmed_at as confirmedAt
+       FROM races WHERE race_id = ?`,
+    )
+    .get(raceId) as
+    | {
+        raceId: string
+        raceName: string
+        course: string
+        venue: string
+        raceDate: string
+        predictedAt: string
+        confirmedAt: string | null
+      }
+    | undefined
+  if (!race) return null
+
+  const predictions = db
+    .prepare(
+      `SELECT umaban, name, finish_position as finishPosition
+       FROM predictions WHERE race_id = ?`,
+    )
+    .all(raceId) as { umaban: number; name: string; finishPosition: number | null }[]
+
+  const nameByUmaban = new Map(predictions.map((p) => [p.umaban, p.name]))
+
+  const finishOrder = predictions
+    .filter((p) => p.finishPosition != null)
+    .sort((a, b) => (a.finishPosition ?? 0) - (b.finishPosition ?? 0))
+
+  const bets = db
+    .prepare(
+      `SELECT bet_type as betType, umaban_combo as umabanCombo, probability, hit, payout
+       FROM bets WHERE race_id = ?`,
+    )
+    .all(raceId) as { betType: string; umabanCombo: string; probability: number; hit: number | null; payout: number | null }[]
+
+  const betsByType: Record<string, RaceDetailBet[]> = {}
+  let totalAttempts = 0
+  let totalPayout = 0
+  for (const b of bets) {
+    const names = b.umabanCombo
+      .split(',')
+      .map((u) => nameByUmaban.get(Number(u)) ?? u)
+      .join(' - ')
+    if (!betsByType[b.betType]) betsByType[b.betType] = []
+    betsByType[b.betType].push({
+      umabanCombo: b.umabanCombo,
+      names,
+      probability: b.probability,
+      hit: b.hit == null ? null : !!b.hit,
+      payout: b.payout,
+    })
+    if (race.confirmedAt) {
+      totalAttempts += 1
+      totalPayout += b.payout ?? 0
+    }
+  }
+  for (const type of Object.keys(betsByType)) {
+    betsByType[type].sort((a, b) => b.probability - a.probability)
+  }
+
+  return {
+    ...race,
+    finishOrder,
+    betsByType,
+    totalAttempts,
+    totalPayout,
+    returnRate: race.confirmedAt && totalAttempts > 0 ? Math.round((totalPayout / (totalAttempts * 100)) * 1000) / 10 : null,
+  }
 }
 
 export type BetTypeStats = {
@@ -378,4 +540,50 @@ export function getStats(): BetTypeStats[] {
     totalPayout: r.totalPayout,
     returnRate: r.attempts > 0 ? Math.round((r.totalPayout / (r.attempts * 100)) * 1000) / 10 : 0,
   }))
+}
+
+export type StatsPeriodPoint = {
+  period: string // 'day' なら YYYY-MM-DD、'month' なら YYYY-MM
+  attempts: number
+  hits: number
+  totalPayout: number
+  returnRate: number // 当該期間単体の回収率(%)
+  cumulativeReturnRate: number // 集計開始からの累積回収率(%)
+}
+
+// ダッシュボードの回収率推移グラフ用。race_date が無い古いレコードは confirmed_at の日付で代用する。
+export function getStatsByPeriod(granularity: 'day' | 'month'): StatsPeriodPoint[] {
+  const periodExpr =
+    granularity === 'month'
+      ? "substr(COALESCE(r.race_date, substr(r.confirmed_at, 1, 10)), 1, 7)"
+      : "COALESCE(r.race_date, substr(r.confirmed_at, 1, 10))"
+
+  const rows = db
+    .prepare(
+      `SELECT ${periodExpr} as period,
+              COUNT(*) as attempts,
+              SUM(CASE WHEN b.hit = 1 THEN 1 ELSE 0 END) as hits,
+              SUM(COALESCE(b.payout, 0)) as totalPayout
+       FROM bets b
+       JOIN races r ON r.race_id = b.race_id
+       WHERE r.confirmed_at IS NOT NULL
+       GROUP BY period
+       ORDER BY period ASC`,
+    )
+    .all() as { period: string; attempts: number; hits: number; totalPayout: number }[]
+
+  let cumAttempts = 0
+  let cumPayout = 0
+  return rows.map((r) => {
+    cumAttempts += r.attempts
+    cumPayout += r.totalPayout
+    return {
+      period: r.period,
+      attempts: r.attempts,
+      hits: r.hits,
+      totalPayout: r.totalPayout,
+      returnRate: r.attempts > 0 ? Math.round((r.totalPayout / (r.attempts * 100)) * 1000) / 10 : 0,
+      cumulativeReturnRate: cumAttempts > 0 ? Math.round((cumPayout / (cumAttempts * 100)) * 1000) / 10 : 0,
+    }
+  })
 }

@@ -219,6 +219,24 @@ export function estimateRunningStyle(history: PastRace[]): RunningStyle {
   return '追込'
 }
 
+// 券種選定時の1位・2位の推定勝率差(probabilityGap、%pt)を0-100の確度スコアに変換する。
+// 既存の堅い(>=12pt)/やや堅い(>=6pt)/混戦の閾値に合わせてキャリブレーションした単調増加の一次式。
+export function confidenceScore(probabilityGap: number): number {
+  return Math.max(0, Math.min(100, Math.round(40 + probabilityGap * 4)))
+}
+
+export const FACTOR_LABELS: Record<keyof PredictionBreakdown, string> = {
+  recentForm: '近走成績',
+  distanceAptitude: '距離適性',
+  surfaceAptitude: '馬場適性(芝/ダート)',
+  trackConditionAptitude: '馬場状態適性',
+  classAdequacy: 'クラス適性',
+  jockeyContinuity: '騎手相性',
+  condition: '馬体重・調子',
+  pedigree: '血統評価',
+  market: '市場評価(人気)',
+}
+
 export type PredictionBreakdown = {
   recentForm: number
   distanceAptitude: number
@@ -253,6 +271,36 @@ const WEIGHTS: Record<keyof PredictionBreakdown, number> = {
   condition: 0.08,
   pedigree: 0.17,
   market: 0.1,
+}
+
+// breakdownの各項目のうち、評価が高い順・低い順の要因をファクトベースの短文にまとめる。
+// 数値は実際にscoreHorse()が算出したbreakdown値そのもので、文章内で創作・脚色はしない。
+export function describeAxisPick(
+  horseName: string,
+  winProbability: number,
+  runningStyle: RunningStyle,
+  breakdown: PredictionBreakdown,
+): string {
+  const entries = (Object.keys(breakdown) as (keyof PredictionBreakdown)[])
+    .map((key) => ({ key, label: FACTOR_LABELS[key], score: Math.round(breakdown[key]) }))
+    .sort((a, b) => b.score - a.score)
+
+  const strengths = entries.filter((e) => e.score >= 60).slice(0, 3)
+  const weaknesses = entries.filter((e) => e.score < 45).slice(0, 2)
+
+  const parts: string[] = []
+  parts.push(`${horseName}は推定勝率${(winProbability * 100).toFixed(1)}%で本命評価。`)
+
+  if (strengths.length > 0) {
+    parts.push(`${strengths.map((s) => `${s.label}(${s.score}点)`).join('・')}が評価を押し上げている。`)
+  }
+  if (weaknesses.length > 0) {
+    parts.push(`一方で${weaknesses.map((w) => `${w.label}(${w.score}点)`).join('・')}はやや見劣りする材料。`)
+  }
+  if (runningStyle !== '不明') {
+    parts.push(`脚質は${runningStyle}想定。`)
+  }
+  return parts.join('')
 }
 
 type ScoredHorse = Omit<HorsePrediction, 'rank' | 'winProbability' | 'placeProbability' | 'winEv'>

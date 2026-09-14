@@ -6,7 +6,9 @@ import {
   fetchPedigree,
   fetchRaceResult,
   discoverUpcomingRaceIds,
+  discoverPastRaceIds,
   jitteredSleep,
+  NetkeibaBlockedError,
 } from './netkeiba'
 import { scoreHorse, rankPredictions, suggestBets } from './predict'
 import {
@@ -17,6 +19,9 @@ import {
   getRecentPicks,
   getCachedHorse,
   saveCachedHorse,
+  isRaceConfirmed,
+  getStatsByPeriod,
+  getRaceDetail,
 } from './db'
 
 const app = express()
@@ -81,7 +86,11 @@ app.get('/api/predict/:raceId', async (req, res) => {
     res.json(result)
   } catch (err) {
     console.error(err)
-    res.status(502).json({ error: 'netkeiba からのデータ取得に失敗しました。しばらく待って再試行してください。' })
+    const error =
+      err instanceof NetkeibaBlockedError
+        ? 'netkeibaからアクセス制限を受けた可能性があります。時間を置いてから再試行してください。'
+        : 'netkeiba からのデータ取得に失敗しました。しばらく待って再試行してください。'
+    res.status(502).json({ error })
   }
 })
 
@@ -107,7 +116,11 @@ app.post('/api/results/:raceId', async (req, res) => {
     res.json({ ok: true, result })
   } catch (err) {
     console.error(err)
-    res.status(502).json({ error: 'netkeiba からの結果取得に失敗しました。しばらく待って再試行してください。' })
+    const error =
+      err instanceof NetkeibaBlockedError
+        ? 'netkeibaからアクセス制限を受けた可能性があります。時間を置いてから再試行してください。'
+        : 'netkeiba からの結果取得に失敗しました。しばらく待って再試行してください。'
+    res.status(502).json({ error })
   }
 })
 
@@ -116,9 +129,25 @@ app.get('/api/history', (_req, res) => {
   res.json({ races: getHistory() })
 })
 
+// 予想履歴1件の詳細(買い目・実際の着順・的中結果)
+app.get('/api/history/:raceId', (req, res) => {
+  const detail = getRaceDetail(req.params.raceId)
+  if (!detail) {
+    res.status(404).json({ error: 'レースが見つかりません' })
+    return
+  }
+  res.json({ detail })
+})
+
 // 券種別の的中率・回収率(100円/点換算)
 app.get('/api/stats', (_req, res) => {
   res.json({ stats: getStats() })
+})
+
+// ダッシュボードの回収率推移グラフ用(日別/月別)
+app.get('/api/stats/timeseries', (req, res) => {
+  const granularity = req.query.granularity === 'month' ? 'month' : 'day'
+  res.json({ points: getStatsByPeriod(granularity) })
 })
 
 // ダッシュボード表示用: 直近N件の予想レースの自信がある買い目
@@ -159,7 +188,12 @@ app.post('/api/batch-predict', (req, res) => {
     } catch (err) {
       console.error(err)
       job.status = 'error'
-      job.error = err instanceof Error ? err.message : 'unknown error'
+      job.error =
+        err instanceof NetkeibaBlockedError
+          ? 'netkeibaからアクセス制限を受けた可能性があるため中断しました。時間を置いてから再試行してください。'
+          : err instanceof Error
+            ? err.message
+            : 'unknown error'
     }
   })()
 })
@@ -173,6 +207,91 @@ app.get('/api/batch-predict/:jobId', (req, res) => {
   res.json(job)
 })
 
-app.listen(PORT, () => {
-  console.log(`Prediction API server listening on http://localhost:${PORT}`)
+// --- 過去レースの一括バックフィル(モデル精度検証用データ作成のための一時的な特例機能) ---
+// 通常の利用(/predict, /api/batch-predict)より大幅に件数が多くなるため、
+// レース間・日付間の休止をさらに長く取り、安全性を優先する。
+const BACKFILL_BETWEEN_RACES_MS: [number, number] = [5000, 12000]
+
+type BackfillJob = {
+  status: 'discovering' | 'running' | 'done' | 'error'
+  totalDays: number
+  daysScanned: number
+  racesFound: number
+  racesCompleted: number
+  racesSkipped: number
+  racesFailed: number
+  currentRaceId: string | null
+  error?: string
+}
+const backfillJobs = new Map<string, BackfillJob>()
+
+app.post('/api/backfill', (req, res) => {
+  const daysBack = Math.min(Math.max(Number(req.body?.daysBack) || 60, 1), 120)
+  const jobId = crypto.randomUUID()
+  const job: BackfillJob = {
+    status: 'discovering',
+    totalDays: daysBack,
+    daysScanned: 0,
+    racesFound: 0,
+    racesCompleted: 0,
+    racesSkipped: 0,
+    racesFailed: 0,
+    currentRaceId: null,
+  }
+  backfillJobs.set(jobId, job)
+  res.json({ jobId })
+
+  ;(async () => {
+    try {
+      const found = await discoverPastRaceIds(daysBack)
+      job.racesFound = found.length
+      job.daysScanned = daysBack
+      job.status = 'running'
+
+      for (let i = 0; i < found.length; i++) {
+        const { raceId } = found[i]
+        job.currentRaceId = raceId
+        if (isRaceConfirmed(raceId)) {
+          job.racesSkipped++
+        } else {
+          try {
+            await predictRace(raceId)
+            const result = await fetchRaceResult(raceId)
+            if (result) saveRaceResult(raceId, result)
+            job.racesCompleted++
+          } catch (err) {
+            if (err instanceof NetkeibaBlockedError) throw err // ブロック時は残りを消化せず即座に中断する
+            console.error(`backfill failed for ${raceId}:`, err)
+            job.racesFailed++
+          }
+        }
+        if (i < found.length - 1) await jitteredSleep(...BACKFILL_BETWEEN_RACES_MS)
+      }
+      job.currentRaceId = null
+      job.status = 'done'
+    } catch (err) {
+      console.error(err)
+      job.status = 'error'
+      job.error =
+        err instanceof NetkeibaBlockedError
+          ? 'netkeibaからアクセス制限を受けた可能性があるため中断しました。時間を置いてから再試行してください。'
+          : err instanceof Error
+            ? err.message
+            : 'unknown error'
+    }
+  })()
+})
+
+app.get('/api/backfill/:jobId', (req, res) => {
+  const job = backfillJobs.get(req.params.jobId)
+  if (!job) {
+    res.status(404).json({ error: 'ジョブが見つかりません' })
+    return
+  }
+  res.json(job)
+})
+
+// '0.0.0.0'を明示し、Tailscale等の他ネットワーク経由(スマホ含む)からもアクセスできるようにする
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Prediction API server listening on http://0.0.0.0:${PORT}`)
 })
