@@ -142,7 +142,49 @@ function formatPct(p: number) {
   return `${(p * 100).toFixed(1)}%`
 }
 
-function CombosRow({ label, combos, ordered = false }: { label: string; combos: Combo[]; ordered?: boolean }) {
+const STAKE_UNIT_YEN = 100
+
+// 予算(円)を、重み(推定確率など)に比例して100円単位に丸めて配分する。
+// 端数は最も重みが大きいものから順に100円ずつ割り振り、合計が予算とずれないようにする。
+function splitBudget(budget: number, weights: number[]): number[] {
+  const flooredBudget = Math.floor(budget / STAKE_UNIT_YEN) * STAKE_UNIT_YEN
+  const totalWeight = weights.reduce((s, w) => s + w, 0)
+  if (flooredBudget <= 0 || totalWeight <= 0 || weights.length === 0) return weights.map(() => 0)
+
+  const raw = weights.map((w) => (flooredBudget * w) / totalWeight)
+  const rounded = raw.map((v) => Math.floor(v / STAKE_UNIT_YEN) * STAKE_UNIT_YEN)
+  let remainder = flooredBudget - rounded.reduce((s, v) => s + v, 0)
+
+  const order = weights.map((_, i) => i).sort((a, b) => weights[b] - weights[a])
+  let i = 0
+  while (remainder >= STAKE_UNIT_YEN && order.length > 0) {
+    rounded[order[i % order.length]] += STAKE_UNIT_YEN
+    remainder -= STAKE_UNIT_YEN
+    i++
+  }
+  return rounded
+}
+
+function StakeBadge({ stakeYen }: { stakeYen: number }) {
+  if (stakeYen <= 0) return null
+  return (
+    <span className="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle ms-1">
+      {stakeYen.toLocaleString()}円({stakeYen / STAKE_UNIT_YEN}口)
+    </span>
+  )
+}
+
+function CombosRow({
+  label,
+  combos,
+  stakes,
+  ordered = false,
+}: {
+  label: string
+  combos: Combo[]
+  stakes: number[]
+  ordered?: boolean
+}) {
   if (combos.length === 0) return null
   const separator = ordered ? '→' : '-'
   return (
@@ -156,6 +198,7 @@ function CombosRow({ label, combos, ordered = false }: { label: string; combos: 
           <span key={i} className="badge bg-light text-dark border fw-normal" title={`推定的中確率 ${formatPct(combo.probability)}`}>
             {combo.picks.map((p) => `${p.umaban}`).join(separator)}
             <span className="text-muted ms-1">{formatPct(combo.probability)}</span>
+            <StakeBadge stakeYen={stakes[i] ?? 0} />
           </span>
         ))}
       </div>
@@ -163,22 +206,87 @@ function CombosRow({ label, combos, ordered = false }: { label: string; combos: 
   )
 }
 
+// 券種の並び順(表示順=配分順)。全券種に均等に予算を割り振る単純な配分方式。
+const BET_TYPE_KEYS = ['tansho', 'fukusho', 'umaren', 'wide', 'umatan', 'sanrenpuku', 'sanrentan'] as const
+
 function BetSuggestionsCard({ bets }: { bets: BetSuggestions }) {
+  const [budget, setBudget] = useState(3000)
+
+  const activeTypeCount = BET_TYPE_KEYS.filter((k) => {
+    if (k === 'tansho') return bets.tansho.length > 0
+    if (k === 'fukusho') return bets.fukusho.length > 0
+    return bets[k].length > 0
+  }).length
+  const perTypeBudgets = splitBudget(
+    budget,
+    Array.from({ length: activeTypeCount }, () => 1),
+  )
+  let typeIdx = 0
+  const nextTypeBudget = () => perTypeBudgets[typeIdx++] ?? 0
+
+  const tanshoBudget = bets.tansho.length > 0 ? nextTypeBudget() : 0
+  const tanshoStakes = splitBudget(
+    tanshoBudget,
+    bets.tansho.map((t) => t.winProbability),
+  )
+
+  const fukushoBudget = bets.fukusho.length > 0 ? nextTypeBudget() : 0
+  const fukushoStakes = splitBudget(
+    fukushoBudget,
+    bets.fukusho.map((f) => f.placeProbability),
+  )
+
+  const umarenBudget = bets.umaren.length > 0 ? nextTypeBudget() : 0
+  const umarenStakes = splitBudget(umarenBudget, bets.umaren.map((c) => c.probability))
+
+  const wideBudget = bets.wide.length > 0 ? nextTypeBudget() : 0
+  const wideStakes = splitBudget(wideBudget, bets.wide.map((c) => c.probability))
+
+  const umatanBudget = bets.umatan.length > 0 ? nextTypeBudget() : 0
+  const umatanStakes = splitBudget(umatanBudget, bets.umatan.map((c) => c.probability))
+
+  const sanrenpukuBudget = bets.sanrenpuku.length > 0 ? nextTypeBudget() : 0
+  const sanrenpukuStakes = splitBudget(sanrenpukuBudget, bets.sanrenpuku.map((c) => c.probability))
+
+  const sanrentanBudget = bets.sanrentan.length > 0 ? nextTypeBudget() : 0
+  const sanrentanStakes = splitBudget(sanrentanBudget, bets.sanrentan.map((c) => c.probability))
+
+  const totalStakeYen = [tanshoStakes, fukushoStakes, umarenStakes, wideStakes, umatanStakes, sanrenpukuStakes, sanrentanStakes]
+    .flat()
+    .reduce((s, v) => s + v, 0)
+
   return (
     <div className="card border-0 shadow-sm mb-3">
       <div className="card-body">
-        <div className="d-flex align-items-center gap-2 mb-3">
+        <div className="d-flex align-items-center gap-2 mb-2 flex-wrap">
           <h2 className="h6 fw-bold mb-0">推奨買い目</h2>
           <span className={`badge ${confidenceBadgeClass(bets.confidence)}`}>{bets.confidence}</span>
           <span className="text-muted small">1位-2位推定勝率差: {bets.probabilityGap}pt</span>
+        </div>
+
+        <div className="d-flex align-items-center gap-2 mb-3">
+          <label htmlFor="budget-input" className="small text-muted mb-0">
+            このレースの予算
+          </label>
+          <input
+            id="budget-input"
+            type="number"
+            className="form-control form-control-sm"
+            style={{ width: 120 }}
+            min={0}
+            step={100}
+            value={budget}
+            onChange={(e) => setBudget(Math.max(0, Number(e.target.value) || 0))}
+          />
+          <span className="small text-muted">円 ・ 券種ごとに均等配分し、券種内は推定確率に比例して100円単位で配分</span>
         </div>
 
         <div className="row g-3">
           <div className="col-md-6">
             <div className="mb-2">
               <div className="text-muted small mb-1">単勝</div>
-              {bets.tansho.map((t) => (
-                <div key={t.pick.umaban} className="d-flex align-items-center gap-2">
+              {bets.tansho.map((t, i) => (
+                <div key={t.pick.umaban} className="d-flex align-items-center gap-2 flex-wrap">
                   <PickBadge pick={t.pick} />
                   <span className="text-muted small">推定勝率 {formatPct(t.winProbability)}</span>
                   {t.odds != null ? (
@@ -188,30 +296,40 @@ function BetSuggestionsCard({ bets }: { bets: BetSuggestions }) {
                   ) : (
                     <span className="text-muted small">オッズ未確定</span>
                   )}
+                  <StakeBadge stakeYen={tanshoStakes[i] ?? 0} />
                 </div>
               ))}
             </div>
             <div className="mb-2">
               <div className="text-muted small mb-1">複勝</div>
-              {bets.fukusho.map((f) => (
-                <div key={f.pick.umaban} className="d-flex align-items-center gap-2">
+              {bets.fukusho.map((f, i) => (
+                <div key={f.pick.umaban} className="d-flex align-items-center gap-2 flex-wrap">
                   <PickBadge pick={f.pick} />
                   <span className="text-muted small">推定複勝率 {formatPct(f.placeProbability)}</span>
+                  <StakeBadge stakeYen={fukushoStakes[i] ?? 0} />
                 </div>
               ))}
             </div>
-            <CombosRow label="馬連" combos={bets.umaren} />
-            <CombosRow label="ワイド" combos={bets.wide} />
+            <CombosRow label="馬連" combos={bets.umaren} stakes={umarenStakes} />
+            <CombosRow label="ワイド" combos={bets.wide} stakes={wideStakes} />
           </div>
           <div className="col-md-6">
-            <CombosRow label="馬単" combos={bets.umatan} ordered />
-            <CombosRow label="三連複" combos={bets.sanrenpuku} />
-            <CombosRow label="三連単" combos={bets.sanrentan} ordered />
+            <CombosRow label="馬単" combos={bets.umatan} stakes={umatanStakes} ordered />
+            <CombosRow label="三連複" combos={bets.sanrenpuku} stakes={sanrenpukuStakes} />
+            <CombosRow label="三連単" combos={bets.sanrentan} stakes={sanrentanStakes} ordered />
           </div>
         </div>
+
+        <div className="small fw-semibold mt-2">
+          合計購入額: {totalStakeYen.toLocaleString()}円({totalStakeYen / STAKE_UNIT_YEN}口)
+          {totalStakeYen !== budget && (
+            <span className="text-muted fw-normal ms-1">(予算{budget.toLocaleString()}円のうち100円単位で配分)</span>
+          )}
+        </div>
+
         <p className="text-muted small mb-0 mt-2">
           <i className="bi bi-info-circle me-1" />
-          推定勝率上位{bets.boxSize}頭を基準に、Harvilleモデルで算出した的中確率順に表示しています。馬単・三連単は1位を軸に固定。EVは推定勝率×オッズ(1超で理論上プラス期待値)。オッズ・確率は未検証のモデルによる参考値です。
+          推定勝率上位{bets.boxSize}頭を基準に、Harvilleモデルで算出した的中確率順に表示しています。馬単・三連単は1位を軸に固定。EVは推定勝率×オッズ(1超で理論上プラス期待値)。金額は入力した予算を券種ごとに均等配分し、券種内は推定確率に比例して100円単位で機械的に配分した参考値で、資金管理上の推奨ではありません。オッズ・確率は未検証のモデルによる参考値です。
         </p>
       </div>
     </div>
