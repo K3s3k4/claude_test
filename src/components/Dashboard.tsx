@@ -1,13 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
+import BetTypeStatsCard from './BetTypeStatsCard'
 import {
   ResponsiveContainer,
   LineChart,
   Line,
   AreaChart,
   Area,
-  BarChart,
-  Bar,
-  Cell,
   CartesianGrid,
   XAxis,
   YAxis,
@@ -15,62 +13,47 @@ import {
   ReferenceLine,
 } from 'recharts'
 
-type RecentPickCombo = { umabanCombo: string; names: string; probability: number }
-type PredictionBreakdown = {
-  recentForm: number
-  distanceAptitude: number
-  surfaceAptitude: number
-  trackConditionAptitude: number
-  classAdequacy: number
-  jockeyContinuity: number
-  condition: number
-  pedigree: number
-  market: number
-}
-type AxisAnalysis = {
-  umaban: number
-  horseName: string
-  winProbability: number
-  runningStyle: string
-  breakdown: PredictionBreakdown
-  summary: string
+type Pick = { umaban: number; name: string }
+type PricedCombo = { picks: Pick[]; probability: number; stakeYen: number }
+type PricedSingle = { pick: Pick; stakeYen: number }
+type JrdbBetSuggestions = {
+  boxSize: number
+  tansho: (PricedSingle & { winProbability: number })[]
+  fukusho: (PricedSingle & { placeProbability: number })[]
+  umaren: PricedCombo[]
+  wide: PricedCombo[]
+  umatan: PricedCombo[]
+  sanrenpuku: PricedCombo[]
+  sanrentan: PricedCombo[]
+  totalStakeYen: number
 }
 type RecentPick = {
-  raceId: string
-  raceName: string
-  course: string
-  venue: string
+  raceKey: string
   raceDate: string
-  predictedAt: string
-  confidence: string | null
-  probabilityGap: number | null
-  confidenceScore: number | null
-  betsByType: Record<string, RecentPickCombo[]>
-  axisAnalysis: AxisAnalysis | null
+  venueCode: string
+  venueName: string
+  raceNumber: number
+  raceName: string | null
+  gradeLabel: string | null
+  confidence: '堅い' | 'やや堅い' | '混戦'
+  confidenceScore: number
+  topPickSummary: string
+  completed: boolean
+  totalStakeYen: number | null
+  totalPayoutYen: number | null
+  returnRate: number | null
+  bets: JrdbBetSuggestions | null
 }
 
-const FACTOR_LABELS: Record<keyof PredictionBreakdown, string> = {
-  recentForm: '近走成績',
-  distanceAptitude: '距離適性',
-  surfaceAptitude: '馬場適性(芝/ダート)',
-  trackConditionAptitude: '馬場状態適性',
-  classAdequacy: 'クラス適性',
-  jockeyContinuity: '騎手相性',
-  condition: '馬体重・調子',
-  pedigree: '血統評価',
-  market: '市場評価(人気)',
+const COMBO_TYPE_LABELS: Record<string, string> = {
+  umaren: '馬連',
+  wide: 'ワイド',
+  umatan: '馬単',
+  sanrenpuku: '三連複',
+  sanrentan: '三連単',
 }
-const FACTOR_ORDER: (keyof PredictionBreakdown)[] = [
-  'recentForm',
-  'distanceAptitude',
-  'surfaceAptitude',
-  'trackConditionAptitude',
-  'classAdequacy',
-  'jockeyContinuity',
-  'condition',
-  'pedigree',
-  'market',
-]
+const COMBO_TYPE_ORDER = ['umaren', 'wide', 'umatan', 'sanrenpuku', 'sanrentan']
+const ORDERED_COMBO_TYPES = new Set(['umatan', 'sanrentan'])
 
 function confidenceScoreClass(score: number) {
   if (score >= 80) return 'text-success'
@@ -84,25 +67,6 @@ function formatRaceDate(dateStr: string) {
   return d.toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })
 }
 
-type BatchJob = {
-  status: 'running' | 'done' | 'error'
-  total: number
-  completed: number
-  raceIds: string[]
-  error?: string
-}
-
-const BET_TYPE_LABELS: Record<string, string> = {
-  tansho: '単勝',
-  fukusho: '複勝',
-  umaren: '馬連',
-  wide: 'ワイド',
-  umatan: '馬単',
-  sanrenpuku: '三連複',
-  sanrentan: '三連単',
-}
-const BET_TYPE_ORDER = ['tansho', 'fukusho', 'umaren', 'wide', 'umatan', 'sanrenpuku', 'sanrentan']
-
 function confidenceBadgeClass(confidence: string | null) {
   if (confidence === '堅い') return 'bg-success'
   if (confidence === 'やや堅い') return 'bg-primary'
@@ -110,165 +74,168 @@ function confidenceBadgeClass(confidence: string | null) {
   return 'bg-secondary'
 }
 
-function RecentPicksSection() {
-  const [picks, setPicks] = useState<RecentPick[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [job, setJob] = useState<BatchJob | null>(null)
-  const [expandedRaceId, setExpandedRaceId] = useState<string | null>(null)
+type JrdbSyncJob = {
+  status: 'running' | 'done' | 'error'
+  totalChecks: number
+  checked: number
+  downloaded: number
+  skippedNoData: number
+  failed: number
+  error?: string
+}
+
+function JrdbSyncSection() {
+  const [job, setJob] = useState<JrdbSyncJob | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  async function loadPicks() {
-    setLoading(true)
-    try {
-      const res = await fetch('/api/dashboard/recent-picks?limit=4')
-      const json = await res.json()
-      setPicks(json.picks)
-    } catch {
-      setError('直近の予想の取得に失敗しました')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    loadPicks()
-    return () => {
+  useEffect(
+    () => () => {
       if (pollRef.current) clearInterval(pollRef.current)
-    }
-  }, [])
+    },
+    [],
+  )
 
-  async function handleFetchRaces() {
-    setError(null)
-    try {
-      const res = await fetch('/api/batch-predict', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ count: 4 }),
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json.error || '開始に失敗しました')
-
-      pollRef.current = setInterval(async () => {
-        const statusRes = await fetch(`/api/batch-predict/${json.jobId}`)
-        const statusJson: BatchJob = await statusRes.json()
-        setJob(statusJson)
-        if (statusJson.status !== 'running') {
-          if (pollRef.current) clearInterval(pollRef.current)
-          if (statusJson.status === 'done') loadPicks()
-        }
-      }, 3000)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '開始に失敗しました')
-    }
+  async function handleSync() {
+    const res = await fetch('/api/jrdb/sync', { method: 'POST' })
+    const json = await res.json()
+    pollRef.current = setInterval(async () => {
+      const statusRes = await fetch(`/api/jrdb/sync/${json.jobId}`)
+      const statusJson: JrdbSyncJob = await statusRes.json()
+      setJob(statusJson)
+      if (statusJson.status !== 'running' && pollRef.current) {
+        clearInterval(pollRef.current)
+      }
+    }, 2000)
   }
 
   const isRunning = job?.status === 'running'
 
   return (
     <div className="card border-0 shadow-sm mb-4">
+      <div className="card-body d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <div>
+          <h2 className="h6 fw-bold mb-1">JRDBデータの更新</h2>
+          <p className="text-muted small mb-0">
+            過去14日・未来10日分の未取得データを確認して取得します(週1回は自動でも実行されます)。
+          </p>
+          {job && (
+            <p className="small mb-0 mt-1">
+              {job.status === 'running' && (
+                <>
+                  <span className="spinner-border spinner-border-sm me-2" role="status" />
+                  確認中: {job.checked}/{job.totalChecks}(取得{job.downloaded})
+                </>
+              )}
+              {job.status === 'done' && `完了: 取得${job.downloaded} / データなし${job.skippedNoData} / 失敗${job.failed}`}
+              {job.status === 'error' && <span className="text-danger">エラー: {job.error}</span>}
+            </p>
+          )}
+        </div>
+        <button type="button" className="btn btn-sm btn-outline-primary" disabled={isRunning} onClick={handleSync}>
+          {isRunning ? '更新中...' : '未取得分を取得'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function RecentPicksSection() {
+  const [picks, setPicks] = useState<RecentPick[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [expandedKey, setExpandedKey] = useState<string | null>(null)
+
+  useEffect(() => {
+    setLoading(true)
+    fetch('/api/jrdb/recent-picks?limit=4')
+      .then((r) => r.json())
+      .then((json) => setPicks(json.picks))
+      .catch(() => setError('直近の自信がある買い目の取得に失敗しました'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  return (
+    <div className="card border-0 shadow-sm mb-4">
       <div className="card-body">
         <div className="d-flex justify-content-between align-items-center mb-3">
-          <h2 className="h6 fw-bold mb-0">直近の自信がある買い目</h2>
-          <button type="button" className="btn btn-sm btn-primary" disabled={isRunning} onClick={handleFetchRaces}>
-            {isRunning ? (
-              <>
-                <span className="spinner-border spinner-border-sm me-2" role="status" />
-                取得中 {job?.completed}/{job?.total || '?'}
-              </>
-            ) : (
-              '開催予定レースを取得して予想'
-            )}
-          </button>
+          <h2 className="h6 fw-bold mb-0">直近の自信がある買い目(JRDB)</h2>
         </div>
 
         {error && <div className="alert alert-danger py-2 small">{error}</div>}
-        {job?.status === 'error' && (
-          <div className="alert alert-danger py-2 small">取得中にエラーが発生しました: {job.error}</div>
-        )}
-        {isRunning && (
-          <p className="text-muted small">
-            出走馬ごとに過去成績・血統を取得するため、レース1件あたり数十秒〜数分かかります。このまま他の画面を見ても構いません。
-          </p>
-        )}
 
         {loading ? (
           <p className="text-muted small mb-0">読み込み中...</p>
         ) : picks.length === 0 ? (
-          <p className="text-muted small mb-0">
-            まだ予想履歴がありません。上のボタンで開催予定レースを取得するか、/predict で個別に予想してください。
-          </p>
+          <p className="text-muted small mb-0">JRDBデータがまだありません。データのダウンロードをお待ちください。</p>
         ) : (
           <div className="row g-3">
             {picks.map((p) => {
-              const isExpanded = expandedRaceId === p.raceId
+              const isExpanded = expandedKey === p.raceKey
               return (
-                <div className="col-md-6" key={p.raceId}>
+                <div className="col-md-6" key={p.raceKey}>
                   <div
                     className="border rounded p-3 h-100"
                     role="button"
-                    onClick={() => setExpandedRaceId(isExpanded ? null : p.raceId)}
+                    onClick={() => setExpandedKey(isExpanded ? null : p.raceKey)}
                   >
                     <div className="d-flex align-items-center gap-2 mb-1 flex-wrap">
-                      <span className="fw-semibold small">{p.raceName || p.raceId}</span>
-                      {p.confidence && (
-                        <span className={`badge ${confidenceBadgeClass(p.confidence)}`}>{p.confidence}</span>
-                      )}
-                      {p.confidenceScore != null && (
-                        <span className={`small fw-bold ${confidenceScoreClass(p.confidenceScore)}`}>
-                          確度 {p.confidenceScore}
-                          <span className="text-muted fw-normal">/100</span>
-                        </span>
-                      )}
+                      <span className="fw-semibold small">
+                        {p.venueName}
+                        {p.raceNumber}R
+                        {p.raceName && ` ${p.raceName}`}
+                        {p.gradeLabel && ` (${p.gradeLabel})`}
+                      </span>
+                      <span className={`badge ${confidenceBadgeClass(p.confidence)}`}>{p.confidence}</span>
+                      <span className={`small fw-bold ${confidenceScoreClass(p.confidenceScore)}`}>
+                        確度 {p.confidenceScore}
+                        <span className="text-muted fw-normal">/100</span>
+                      </span>
                       <i className={`bi ${isExpanded ? 'bi-chevron-up' : 'bi-chevron-down'} text-muted ms-auto`} />
                     </div>
                     <div className="text-muted small mb-2">
                       {formatRaceDate(p.raceDate)}
-                      {p.venue && ` ${p.venue}`}
-                      {' ・ '}
-                      {p.course}
-                    </div>
-                    {BET_TYPE_ORDER.filter((t) => p.betsByType[t]?.length).map((t) => (
-                      <div key={t} className="small mb-1">
-                        <span className="text-muted me-1">{BET_TYPE_LABELS[t]}:</span>
-                        {p.betsByType[t].slice(0, 2).map((c) => (
-                          <span key={c.umabanCombo} className="badge bg-light text-dark border me-1 fw-normal">
-                            {c.umabanCombo} ({(c.probability * 100).toFixed(1)}%)
+                      {p.completed && p.returnRate != null && (
+                        <span className="ms-2">
+                          確定済み・回収率{' '}
+                          <span className={p.returnRate >= 100 ? 'text-success fw-semibold' : 'text-danger fw-semibold'}>
+                            {p.returnRate}%
                           </span>
-                        ))}
-                      </div>
-                    ))}
+                        </span>
+                      )}
+                    </div>
+                    {p.bets && (
+                      <>
+                        <div className="small mb-1">
+                          <span className="text-muted me-1">単勝:</span>
+                          {p.bets.tansho.map((t) => (
+                            <span key={t.pick.umaban} className="badge bg-light text-dark border me-1 fw-normal">
+                              {t.pick.umaban} {t.pick.name} ({(t.winProbability * 100).toFixed(1)}%)
+                              {t.stakeYen > 0 && <span className="text-muted"> ・ {t.stakeYen.toLocaleString()}円</span>}
+                            </span>
+                          ))}
+                        </div>
+                        {COMBO_TYPE_ORDER.filter((t) => p.bets![t as keyof JrdbBetSuggestions] as PricedCombo[]).map((t) => {
+                          const combos = p.bets![t as keyof JrdbBetSuggestions] as PricedCombo[]
+                          if (!combos?.length) return null
+                          const sep = ORDERED_COMBO_TYPES.has(t) ? '→' : '-'
+                          return (
+                            <div key={t} className="small mb-1">
+                              <span className="text-muted me-1">{COMBO_TYPE_LABELS[t]}:</span>
+                              {combos.slice(0, 2).map((c, i) => (
+                                <span key={i} className="badge bg-light text-dark border me-1 fw-normal">
+                                  {c.picks.map((p2) => p2.umaban).join(sep)} ({(c.probability * 100).toFixed(1)}%)
+                                  {c.stakeYen > 0 && <span className="text-muted"> ・ {c.stakeYen.toLocaleString()}円</span>}
+                                </span>
+                              ))}
+                            </div>
+                          )
+                        })}
+                      </>
+                    )}
 
                     {isExpanded && (
                       <div className="mt-2 pt-2 border-top" onClick={(e) => e.stopPropagation()}>
-                        {p.axisAnalysis ? (
-                          <>
-                            <p className="small mb-2">{p.axisAnalysis.summary}</p>
-                            <div className="d-flex flex-column gap-1">
-                              {FACTOR_ORDER.map((key) => {
-                                const score = Math.round(p.axisAnalysis!.breakdown[key])
-                                return (
-                                  <div key={key} className="d-flex align-items-center gap-2">
-                                    <span className="text-muted small" style={{ width: 150, flexShrink: 0 }}>
-                                      {FACTOR_LABELS[key]}
-                                    </span>
-                                    <div className="progress flex-grow-1" style={{ height: 6 }}>
-                                      <div
-                                        className={`progress-bar ${score >= 60 ? 'bg-success' : score < 45 ? 'bg-danger' : 'bg-secondary'}`}
-                                        style={{ width: `${score}%` }}
-                                      />
-                                    </div>
-                                    <span className="small text-muted" style={{ width: 28, textAlign: 'right' }}>
-                                      {score}
-                                    </span>
-                                  </div>
-                                )
-                              })}
-                            </div>
-                          </>
-                        ) : (
-                          <p className="text-muted small mb-0">この予想の詳細データはありません(旧バージョンの予想)。</p>
-                        )}
+                        <p className="small mb-0">{p.topPickSummary}</p>
                       </div>
                     )}
                   </div>
@@ -276,6 +243,12 @@ function RecentPicksSection() {
               )
             })}
           </div>
+        )}
+        {picks.length > 0 && (
+          <p className="text-muted small mb-0 mt-2">
+            <i className="bi bi-info-circle me-1" />
+            JRDBの総合指数をもとに算出した参考値です。金額は1レース3,000円を券種に均等配分し、券種内は推定確率に比例して100円単位で配分した想定購入額です。
+          </p>
         )}
       </div>
     </div>
@@ -292,16 +265,6 @@ type StatsPeriodPoint = {
   totalPayout: number
   returnRate: number
   cumulativeReturnRate: number
-}
-
-type BetTypeStats = {
-  betType: string
-  attempts: number
-  hits: number
-  hitRate: number
-  totalStakeYen: number
-  totalPayout: number
-  returnRate: number
 }
 
 const NAVY = '#0b1f3a'
@@ -379,51 +342,6 @@ function CumulativeReturnCard({ granularity, points, loading }: { granularity: G
   )
 }
 
-function BetTypeReturnCard() {
-  const [stats, setStats] = useState<BetTypeStats[]>([])
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    fetch('/api/stats')
-      .then((r) => r.json())
-      .then((json) => setStats(json.stats))
-      .finally(() => setLoading(false))
-  }, [])
-
-  const data = BET_TYPE_ORDER.filter((t) => stats.some((s) => s.betType === t)).map((t) => {
-    const s = stats.find((x) => x.betType === t)!
-    return { ...s, label: BET_TYPE_LABELS[t] ?? t }
-  })
-
-  return (
-    <div className="card border-0 shadow-sm h-100">
-      <div className="card-body">
-        <h2 className="h6 fw-bold mb-3">券種別の回収率</h2>
-        {loading ? (
-          <div className="text-muted small text-center py-5">読み込み中...</div>
-        ) : data.length === 0 ? (
-          <ChartEmptyState />
-        ) : (
-          <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={data} margin={{ top: 8, right: 12, left: -12, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
-              <XAxis dataKey="label" tick={{ fontSize: 12 }} stroke="#9ca3af" />
-              <YAxis tick={{ fontSize: 12 }} stroke="#9ca3af" unit="%" />
-              <Tooltip formatter={(v, _name, item) => [`${v}% (${item.payload.attempts}件)`, '回収率']} />
-              <ReferenceLine y={100} stroke="#9ca3af" strokeDasharray="4 4" />
-              <Bar dataKey="returnRate" radius={[4, 4, 0, 0]}>
-                {data.map((d) => (
-                  <Cell key={d.betType} fill={d.returnRate >= 100 ? GOLD_BRIGHT : NAVY} fillOpacity={d.returnRate >= 100 ? 1 : 0.55} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        )}
-      </div>
-    </div>
-  )
-}
-
 function StatsSection() {
   const [granularity, setGranularity] = useState<Granularity>('day')
   const [points, setPoints] = useState<StatsPeriodPoint[]>([])
@@ -431,7 +349,7 @@ function StatsSection() {
 
   useEffect(() => {
     setLoading(true)
-    fetch(`/api/stats/timeseries?granularity=${granularity}`)
+    fetch(`/api/jrdb/stats/timeseries?granularity=${granularity}`)
       .then((r) => r.json())
       .then((json) => setPoints(json.points))
       .finally(() => setLoading(false))
@@ -445,11 +363,8 @@ function StatsSection() {
         </div>
       </div>
       <div className="row g-3">
-        <div className="col-lg-6">
+        <div className="col-12">
           <CumulativeReturnCard granularity={granularity} points={points} loading={loading} />
-        </div>
-        <div className="col-lg-6">
-          <BetTypeReturnCard />
         </div>
       </div>
     </>
@@ -504,7 +419,11 @@ function Dashboard() {
         <p className="text-muted mb-0">直近の予想と、これまでの回収率の推移です。</p>
       </div>
 
+      <JrdbSyncSection />
+
       <RecentPicksSection />
+
+      <BetTypeStatsCard />
 
       <StatsSection />
     </div>
