@@ -1,9 +1,9 @@
-// JRDBアーカイブ全体を使って、複数指数(IDM・騎手指数・情報指数・調教指数・厩舎指数)+市場オッズ+
-// 枠番+競馬場+血統(父馬・母父馬の勝率エンコーディング)を特徴量としたロジスティック回帰モデルを学習し、
-// 現行(総合指数のみ)を上回るか検証する。
-// 時系列でtrain/testを分割し、testデータ(モデルが見ていない期間)での実際の馬券回収率で評価する。
-// 血統の勝率エンコーディングはtrainデータのみから計算し、testには一切使わない(リーク防止)。
-// 実行: npx tsx scripts/jrdb-train-model.ts
+// これまでの2つの知見を統合する実験:
+//   1) 単純に「モデルの1位を常に買う」戦略は回収率で市場に勝てない(市場効率が高いため)
+//   2) 「市場が見落としている分だけ買う」バリューベッティングは有望(単勝edge>=4pt→83.3%など)
+// →市場特徴量を除いたロジスティック回帰モデル(JRDB指数+血統のみ)の推定確率を「自分の見立て」とし、
+//   市場のオッズ由来確率との差(エッジ)がしきい値を超えた馬だけに賭けるとどうなるかを検証する。
+// 実行: npx tsx scripts/jrdb-model-value-bet-experiment.ts
 import 'dotenv/config'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -34,31 +34,30 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 
 const VENUE_CODES = Object.keys(VENUE_NAMES)
 
-// --no-market: 市場オッズ由来の特徴量(marketLogProb・basePopularity)を除外し、
-// JRDB指数+血統だけで市場に迎合しない独立した予測ができるか検証する。
-const EXCLUDE_MARKET = process.argv.includes('--no-market')
-
-// 血統(父馬・母父馬)の勝率エンコーディングを含まないベース特徴量
-const BASE_FEATURE_NAMES = [
+// 市場特徴量(marketLogProb・basePopularity)は含めない: 市場と独立な「自分の見立て」を作るため
+const FEATURE_NAMES = [
   'idm',
   'jockeyIndex',
   'infoIndex',
   'trainingIndex',
   'stableIndex',
   'overallIndex',
-  ...(EXCLUDE_MARKET ? [] : ['marketLogProb', 'basePopularity']),
   'headCount',
   ...Array.from({ length: 8 }, (_, i) => `waku${i + 1}`),
   ...VENUE_CODES.map((c) => `venue${c}`),
+  'sireWinRate',
+  'damSireWinRate',
 ]
-const FEATURE_NAMES = [...BASE_FEATURE_NAMES, 'sireWinRate', 'damSireWinRate']
 
 type RawSample = {
   raceKey: string
+  venueCode: string
+  raceNumber: number
   umaban: number
   baseFeatures: number[]
   sireName: string
   damSireName: string
+  odds: number
   win: boolean
   tanshoPayout: number
 }
@@ -87,7 +86,7 @@ async function buildDataset(): Promise<RawSample[]> {
       const ukcRows = parseUkcBuffer(ukcBuf)
       ukcByKetto = new Map(ukcRows.map((r) => [str(r.kettoNumber), r]))
     } catch {
-      // UKC未取得の日は血統情報なしで進める(sireName/damSireNameは空のまま)
+      // UKC未取得の日は血統情報なしで進める
     }
 
     const grouped = new Map<string, KyiRow[]>()
@@ -108,8 +107,6 @@ async function buildDataset(): Promise<RawSample[]> {
         const sed = sedRows.find((r) => r.venueCode === venueCode && r.raceNumber === raceNumber && r.umaban === umaban)
         if (!sed) continue
 
-        const odds = num(h.baseOdds)
-        const marketLogProb = odds > 0 ? Math.log(1 / odds) : 0
         const waku = num(h.waku)
         const wakuOneHot = Array.from({ length: 8 }, (_, i) => (waku === i + 1 ? 1 : 0))
         const venueOneHot = VENUE_CODES.map((c) => (venueCode === c ? 1 : 0))
@@ -125,7 +122,6 @@ async function buildDataset(): Promise<RawSample[]> {
           num(h.trainingIndex),
           num(h.stableIndex),
           num(h.overallIndex),
-          ...(EXCLUDE_MARKET ? [] : [marketLogProb, num(h.basePopularity)]),
           headCount,
           ...wakuOneHot,
           ...venueOneHot,
@@ -133,10 +129,13 @@ async function buildDataset(): Promise<RawSample[]> {
 
         samples.push({
           raceKey: `${dateStr8}-${key}`,
+          venueCode,
+          raceNumber,
           umaban,
           baseFeatures,
           sireName,
           damSireName,
+          odds: num(h.baseOdds),
           win: num(sed.tanshoPayout) > 0,
           tanshoPayout: num(sed.tanshoPayout),
         })
@@ -146,7 +145,6 @@ async function buildDataset(): Promise<RawSample[]> {
   return samples
 }
 
-// 父馬(または母父馬)ごとの勝率を経験ベイズ補正つきで算出する(少頭数の父馬は全体平均に寄せる)。
 function buildPedigreeWinRates(samples: RawSample[], key: 'sireName' | 'damSireName'): { table: Map<string, number>; globalMean: number } {
   const globalMean = samples.filter((s) => s.win).length / samples.length
   const stats = new Map<string, { wins: number; count: number }>()
@@ -165,7 +163,6 @@ function buildPedigreeWinRates(samples: RawSample[], key: 'sireName' | 'damSireN
   return { table, globalMean }
 }
 
-// --- 標準化 ---
 function computeStandardizer(X: number[][]) {
   const n = X.length
   const dim = X[0].length
@@ -179,8 +176,6 @@ function computeStandardizer(X: number[][]) {
 function standardize(features: number[], mean: number[], std: number[]): number[] {
   return features.map((v, i) => (v - mean[i]) / std[i])
 }
-
-// --- ロジスティック回帰(バッチ勾配降下法 + L2正則化) ---
 function sigmoid(z: number): number {
   return 1 / (1 + Math.exp(-z))
 }
@@ -189,7 +184,6 @@ function trainLogisticRegression(X: number[][], y: number[], epochs: number, lr:
   const n = X.length
   const weights = new Array(dim).fill(0)
   let bias = 0
-
   for (let epoch = 0; epoch < epochs; epoch++) {
     const gradW = new Array(dim).fill(0)
     let gradB = 0
@@ -205,7 +199,7 @@ function trainLogisticRegression(X: number[][], y: number[], epochs: number, lr:
   }
   return { weights, bias }
 }
-function predict(features: number[], weights: number[], bias: number): number {
+function predictProb(features: number[], weights: number[], bias: number): number {
   const z = features.reduce((s, v, j) => s + v * weights[j], bias)
   return sigmoid(z)
 }
@@ -213,12 +207,8 @@ function predict(features: number[], weights: number[], bias: number): number {
 async function main() {
   console.log('データセットを構築中...')
   const rawSamples = await buildDataset()
-  const withPedigree = rawSamples.filter((s) => s.sireName).length
-  console.log(
-    `サンプル数: ${rawSamples.length}(${new Set(rawSamples.map((s) => s.raceKey)).size}レース、うち血統判明${withPedigree}件)\n`,
-  )
+  console.log(`サンプル数: ${rawSamples.length}(${new Set(rawSamples.map((s) => s.raceKey)).size}レース)\n`)
 
-  // 時系列でtrain(古い80%) / test(新しい20%)に分割
   const raceKeys = [...new Set(rawSamples.map((s) => s.raceKey))].sort()
   const splitIdx = Math.floor(raceKeys.length * 0.8)
   const trainRaceKeys = new Set(raceKeys.slice(0, splitIdx))
@@ -226,7 +216,6 @@ async function main() {
   const testRaw = rawSamples.filter((s) => !trainRaceKeys.has(s.raceKey))
   console.log(`train: ${trainRaw.length}件 / test: ${testRaw.length}件\n`)
 
-  // 血統の勝率エンコーディングはtrainのみから計算(リーク防止)
   const sireStats = buildPedigreeWinRates(trainRaw, 'sireName')
   const damSireStats = buildPedigreeWinRates(trainRaw, 'damSireName')
   function withPedigreeFeatures(s: RawSample): number[] {
@@ -240,22 +229,16 @@ async function main() {
   const { mean, std } = computeStandardizer(trainX)
   const X = trainX.map((f) => standardize(f, mean, std))
 
-  console.log('学習中...')
+  console.log('学習中(市場特徴量なし)...')
   const { weights, bias } = trainLogisticRegression(X, trainY, 300, 0.3, 0.001)
   console.log('学習完了\n')
 
-  const importances = FEATURE_NAMES.map((name, i) => ({ name, weight: weights[i] })).sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight))
-  console.log('特徴量の重み(影響度上位12):')
-  for (const imp of importances.slice(0, 12)) {
-    console.log(`  ${imp.name}: ${imp.weight.toFixed(3)}`)
-  }
-
-  // --- testセットで評価 ---
-  type EvalSample = { raceKey: string; features: number[]; overallIndex: number; win: boolean; tanshoPayout: number }
+  type EvalSample = { raceKey: string; features: number[]; overallIndex: number; odds: number; win: boolean; tanshoPayout: number }
   const testSamples: EvalSample[] = testRaw.map((s) => ({
     raceKey: s.raceKey,
     features: withPedigreeFeatures(s),
-    overallIndex: s.baseFeatures[BASE_FEATURE_NAMES.indexOf('overallIndex')],
+    overallIndex: s.baseFeatures[FEATURE_NAMES.indexOf('overallIndex')],
+    odds: s.odds,
     win: s.win,
     tanshoPayout: s.tanshoPayout,
   }))
@@ -266,40 +249,84 @@ async function main() {
     testByRace.get(s.raceKey)!.push(s)
   }
 
-  let modelAttempts = 0
-  let modelHits = 0
-  let modelStake = 0
-  let modelPayout = 0
-  let baselineAttempts = 0
-  let baselineHits = 0
-  let baselineStake = 0
-  let baselinePayout = 0
+  const edgeThresholds = [0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14, 0.16, 0.18, 0.2, 0.25, 0.3]
+  const modelResults: Record<number, { attempts: number; hits: number; stake: number; payout: number }> = {}
+  const oiResults: Record<number, { attempts: number; hits: number; stake: number; payout: number }> = {}
+  for (const t of edgeThresholds) {
+    modelResults[t] = { attempts: 0, hits: 0, stake: 0, payout: 0 }
+    oiResults[t] = { attempts: 0, hits: 0, stake: 0, payout: 0 }
+  }
+  const baseline = { attempts: 0, hits: 0, stake: 0, payout: 0 }
 
   for (const horses of testByRace.values()) {
     if (horses.length < 3) continue
 
-    const modelScores = horses.map((h) => predict(standardize(h.features, mean, std), weights, bias))
-    const modelTop = horses[modelScores.indexOf(Math.max(...modelScores))]
-    modelAttempts += 1
-    modelStake += 100
-    modelPayout += modelTop.tanshoPayout
-    if (modelTop.win) modelHits += 1
+    // モデル確率(市場を見ていない予測)をレース内でsoftmax正規化(相対的な確信度として使う)
+    const rawScores = horses.map((h) => predictProb(standardize(h.features, mean, std), weights, bias))
+    const scoreSum = rawScores.reduce((s, v) => s + v, 0)
+    const modelProbs = scoreSum > 0 ? rawScores.map((v) => v / scoreSum) : rawScores
 
-    const baseTop = horses[horses.map((h) => h.overallIndex).indexOf(Math.max(...horses.map((h) => h.overallIndex)))]
-    baselineAttempts += 1
-    baselineStake += 100
-    baselinePayout += baseTop.tanshoPayout
-    if (baseTop.win) baselineHits += 1
+    // 参考: overallIndexのみのsoftmax確率(既存のバリューベット実験と同条件)
+    const T = 8
+    const expScores = horses.map((h) => Math.exp(num(h.overallIndex) / T))
+    const expSum = expScores.reduce((s, v) => s + v, 0)
+    const oiProbs = expScores.map((v) => v / expSum)
+
+    const rawMarket = horses.map((h) => (h.odds > 0 ? 1 / h.odds : 0))
+    const marketSum = rawMarket.reduce((s, v) => s + v, 0)
+    const marketProbs = marketSum > 0 ? rawMarket.map((v) => v / marketSum) : rawMarket
+
+    const topIdx = modelProbs.indexOf(Math.max(...modelProbs))
+    const topHorse = horses[topIdx]
+    baseline.attempts += 1
+    baseline.stake += 100
+    baseline.payout += topHorse.tanshoPayout
+    if (topHorse.win) baseline.hits += 1
+
+    for (let i = 0; i < horses.length; i++) {
+      if (horses[i].odds <= 0) continue
+      const h = horses[i]
+
+      const modelEdge = modelProbs[i] - marketProbs[i]
+      for (const t of edgeThresholds) {
+        if (modelEdge < t) continue
+        const res = modelResults[t]
+        res.attempts += 1
+        res.stake += 100
+        res.payout += h.tanshoPayout
+        if (h.win) res.hits += 1
+      }
+
+      const oiEdge = oiProbs[i] - marketProbs[i]
+      for (const t of edgeThresholds) {
+        if (oiEdge < t) continue
+        const res = oiResults[t]
+        res.attempts += 1
+        res.stake += 100
+        res.payout += h.tanshoPayout
+        if (h.win) res.hits += 1
+      }
+    }
   }
 
-  const modelHitRate = Math.round((modelHits / modelAttempts) * 1000) / 10
-  const modelReturn = Math.round((modelPayout / modelStake) * 1000) / 10
-  const baseHitRate = Math.round((baselineHits / baselineAttempts) * 1000) / 10
-  const baseReturn = Math.round((baselinePayout / baselineStake) * 1000) / 10
+  const fmt = (r: { attempts: number; hits: number; stake: number; payout: number }) => {
+    const hitRate = r.attempts > 0 ? Math.round((r.hits / r.attempts) * 1000) / 10 : 0
+    const returnRate = r.stake > 0 ? Math.round((r.payout / r.stake) * 1000) / 10 : 0
+    return `試行${r.attempts}\t的中${r.hits}\t的中率${hitRate}%\t回収率${returnRate}%`
+  }
 
-  console.log('\n=== テストデータ(直近20%、学習に未使用)での単勝本命1点の回収率比較 ===')
-  console.log(`現行(総合指数のみ): 試行${baselineAttempts} 的中率${baseHitRate}% 回収率${baseReturn}%`)
-  console.log(`新モデル(ロジスティック回帰+血統): 試行${modelAttempts} 的中率${modelHitRate}% 回収率${modelReturn}%`)
+  console.log('=== 常にモデル1位(参考) ===')
+  console.log(fmt(baseline))
+
+  console.log('\n=== バリューベット: 新モデル(市場特徴量なし)の確率 vs 市場確率 ===')
+  for (const t of edgeThresholds) {
+    console.log(`edge>=${(t * 100).toFixed(0)}pt\t${fmt(modelResults[t])}`)
+  }
+
+  console.log('\n=== バリューベット(参考・既存手法): overallIndexのみ vs 市場確率 ===')
+  for (const t of edgeThresholds) {
+    console.log(`edge>=${(t * 100).toFixed(0)}pt\t${fmt(oiResults[t])}`)
+  }
 }
 
 main().catch((err) => {
