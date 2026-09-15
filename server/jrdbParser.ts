@@ -1136,20 +1136,27 @@ export type JrdbStatsPeriodPoint = {
   cumulativeReturnRate: number // 集計開始からの累積金額回収率(%)
 }
 
-// ダッシュボードの回収率推移グラフ用。JRDBアーカイブ全体を日別/月別に集計し、累積回収率も算出する。
+// ダッシュボードの回収率推移グラフ用。期間・確信度で絞り込んだ上で日別/月別に集計し、累積回収率も算出する。
 export async function computeJrdbBacktestTimeseries(
   granularity: 'day' | 'month',
-  confidenceFilter?: string[],
+  options?: { daysBack?: number; confidenceFilter?: string[] },
 ): Promise<JrdbStatsPeriodPoint[]> {
-  const cacheKey = `${granularity}|${[...(confidenceFilter ?? [])].sort().join(',')}`
+  const cacheKey = `${granularity}|${options?.daysBack ?? 'all'}|${[...(options?.confidenceFilter ?? [])].sort().join(',')}`
   const cached = timeseriesCache.get(cacheKey)
   if (cached && Date.now() - cached.computedAt < BACKTEST_CACHE_TTL_MS) {
     return cached.result
   }
 
   let entries = await ensureAnalysisCache()
-  if (confidenceFilter && confidenceFilter.length > 0) {
-    entries = entries.filter((e) => confidenceFilter.includes(e.confidence))
+  if (options?.daysBack) {
+    const cutoff = new Date()
+    cutoff.setHours(0, 0, 0, 0)
+    cutoff.setDate(cutoff.getDate() - options.daysBack)
+    const cutoffIso = isoDateOf(cutoff)
+    entries = entries.filter((e) => e.period >= cutoffIso)
+  }
+  if (options?.confidenceFilter && options.confidenceFilter.length > 0) {
+    entries = entries.filter((e) => options.confidenceFilter!.includes(e.confidence))
   }
 
   const bucket = new Map<string, RaceTypeAgg>()

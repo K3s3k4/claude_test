@@ -372,11 +372,12 @@ app.get('/api/jrdb/stats', async (req, res) => {
   res.json({ summary })
 })
 
-// ダッシュボードの回収率推移グラフ用(日別/月別)。JRDBアーカイブ全体をもとに算出する。
+// ダッシュボードの回収率推移グラフ用(日別/月別)。期間・確信度で絞り込み可能。
 app.get('/api/jrdb/stats/timeseries', async (req, res) => {
   const granularity = req.query.granularity === 'month' ? 'month' : 'day'
+  const daysBack = req.query.daysBack != null ? Number(req.query.daysBack) : undefined
   const confidenceFilter = parseConfidenceFilter(req.query.confidence)
-  const points = await computeJrdbBacktestTimeseries(granularity, confidenceFilter)
+  const points = await computeJrdbBacktestTimeseries(granularity, { daysBack, confidenceFilter })
   res.json({ points })
 })
 

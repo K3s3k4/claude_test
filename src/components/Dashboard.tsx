@@ -267,6 +267,62 @@ type StatsPeriodPoint = {
   cumulativeReturnRate: number
 }
 
+type PeriodOption = 'all' | '365' | '90' | '30' | '7'
+const PERIOD_LABELS: Record<PeriodOption, string> = {
+  all: '全期間',
+  '365': '直近1年',
+  '90': '直近3ヶ月',
+  '30': '直近30日',
+  '7': '直近7日',
+}
+
+type ConfidenceOption = 'all' | 'strict' | 'strictPlus'
+const CONFIDENCE_VALUES: Record<ConfidenceOption, string[]> = {
+  all: [],
+  strict: ['堅い'],
+  strictPlus: ['堅い', 'やや堅い'],
+}
+const CONFIDENCE_LABELS: Record<ConfidenceOption, string> = {
+  all: 'すべてのレース',
+  strict: '「堅い」のみ',
+  strictPlus: '「堅い」+「やや堅い」',
+}
+
+function PeriodSelect({ value, onChange }: { value: PeriodOption; onChange: (p: PeriodOption) => void }) {
+  return (
+    <select
+      className="form-select form-select-sm"
+      style={{ width: 'auto' }}
+      value={value}
+      onChange={(e) => onChange(e.target.value as PeriodOption)}
+    >
+      {(Object.keys(PERIOD_LABELS) as PeriodOption[]).map((opt) => (
+        <option key={opt} value={opt}>
+          {PERIOD_LABELS[opt]}
+        </option>
+      ))}
+    </select>
+  )
+}
+
+function ConfidenceSelect({ value, onChange }: { value: ConfidenceOption; onChange: (c: ConfidenceOption) => void }) {
+  return (
+    <select
+      className="form-select form-select-sm"
+      style={{ width: 'auto' }}
+      value={value}
+      onChange={(e) => onChange(e.target.value as ConfidenceOption)}
+      title="予想時の確信度で絞り込む"
+    >
+      {(Object.keys(CONFIDENCE_LABELS) as ConfidenceOption[]).map((opt) => (
+        <option key={opt} value={opt}>
+          {CONFIDENCE_LABELS[opt]}
+        </option>
+      ))}
+    </select>
+  )
+}
+
 const NAVY = '#0b1f3a'
 const GOLD = '#b8860b'
 const GOLD_BRIGHT = '#d4af37'
@@ -309,7 +365,15 @@ function ChartEmptyState() {
   )
 }
 
-function CumulativeReturnCard({ granularity, points, loading }: { granularity: Granularity; points: StatsPeriodPoint[]; loading: boolean }) {
+function CumulativeReturnCard({
+  granularity,
+  points,
+  loading,
+}: {
+  granularity: Granularity
+  points: StatsPeriodPoint[]
+  loading: boolean
+}) {
   const data = points.map((p) => ({ ...p, label: formatPeriodLabel(p.period, granularity) }))
   return (
     <div className="card border-0 shadow-sm h-100">
@@ -344,22 +408,40 @@ function CumulativeReturnCard({ granularity, points, loading }: { granularity: G
 
 function StatsSection() {
   const [granularity, setGranularity] = useState<Granularity>('day')
+  const [period, setPeriod] = useState<PeriodOption>('all')
+  const [confidenceOption, setConfidenceOption] = useState<ConfidenceOption>('all')
   const [points, setPoints] = useState<StatsPeriodPoint[]>([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     setLoading(true)
-    fetch(`/api/jrdb/stats/timeseries?granularity=${granularity}`)
+    const params: Record<string, string> = { granularity }
+    if (period !== 'all') params.daysBack = period
+    const confidenceValues = CONFIDENCE_VALUES[confidenceOption]
+    if (confidenceValues.length > 0) params.confidence = confidenceValues.join(',')
+
+    fetch(`/api/jrdb/stats/timeseries?${new URLSearchParams(params).toString()}`)
       .then((r) => r.json())
       .then((json) => setPoints(json.points))
       .finally(() => setLoading(false))
-  }, [granularity])
+  }, [granularity, period, confidenceOption])
 
   return (
     <>
+      <div className="card border-0 shadow-sm mb-3">
+        <div className="card-body py-2 d-flex align-items-center gap-2 flex-wrap">
+          <span className="text-muted small me-1">
+            <i className="bi bi-search me-1" />
+            絞り込み:
+          </span>
+          <PeriodSelect value={period} onChange={setPeriod} />
+          <ConfidenceSelect value={confidenceOption} onChange={setConfidenceOption} />
+          <GranularityToggle value={granularity} onChange={setGranularity} />
+        </div>
+      </div>
       <div className="row g-3 mb-3">
         <div className="col-12">
-          <ReturnRateTrendCard granularity={granularity} onGranularityChange={setGranularity} points={points} loading={loading} />
+          <ReturnRateTrendCard granularity={granularity} points={points} loading={loading} />
         </div>
       </div>
       <div className="row g-3">
@@ -373,12 +455,10 @@ function StatsSection() {
 
 function ReturnRateTrendCard({
   granularity,
-  onGranularityChange,
   points,
   loading,
 }: {
   granularity: Granularity
-  onGranularityChange: (g: Granularity) => void
   points: StatsPeriodPoint[]
   loading: boolean
 }) {
@@ -386,10 +466,7 @@ function ReturnRateTrendCard({
   return (
     <div className="card border-0 shadow-sm h-100">
       <div className="card-body">
-        <div className="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
-          <h2 className="h6 fw-bold mb-0">回収率の推移</h2>
-          <GranularityToggle value={granularity} onChange={onGranularityChange} />
-        </div>
+        <h2 className="h6 fw-bold mb-3">回収率の推移</h2>
         {loading ? (
           <div className="text-muted small text-center py-5">読み込み中...</div>
         ) : data.length === 0 ? (
