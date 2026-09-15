@@ -2,7 +2,8 @@ import { NavLink } from 'react-router-dom'
 
 export const NAV_ITEMS = [
   { to: '/', label: 'ダッシュボード', icon: 'bi-speedometer2' },
-  { to: '/predict', label: '競馬予想', icon: 'bi-search' },
+  { to: '/jrdb', label: 'JRDB検索', icon: 'bi-database-fill' },
+  { to: '/predict', label: 'netkeiba情報取得', icon: 'bi-search' },
   { to: '/history', label: '予想履歴', icon: 'bi-clock-history' },
 ]
 
