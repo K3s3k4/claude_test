@@ -22,6 +22,8 @@ data/*.db-shm
 .env
 .env.*
 data/jrdb/
+# JRDB集計の永続キャッシュ(生データから再生成可能)
+data/jrdb-analysis-cache.json
 
 # Editor directories and files
 .vscode/*

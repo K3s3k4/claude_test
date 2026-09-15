@@ -845,13 +845,19 @@ async function scanJrdbRaceDay(date: Date): Promise<JrdbRaceRecord[]> {
 }
 
 // 指定日数分(直近から遡って)のレースレコードをまとめて取得する。
+// 同時に開くファイル数を抑えるため小分けのバッチで処理する(daysBackが大きい場合の急激なメモリ増加を防ぐ)。
 async function scanJrdbRaceRange(daysBack: number): Promise<JrdbRaceRecord[]> {
   const dates = await listAvailableKyiDates()
   const cutoff = new Date()
   cutoff.setHours(0, 0, 0, 0)
   cutoff.setDate(cutoff.getDate() - daysBack)
   const targetDates = dates.filter((d) => d >= cutoff)
-  const results = await Promise.all(targetDates.map((d) => scanJrdbRaceDay(d)))
+
+  const results: JrdbRaceRecord[][] = []
+  for (let i = 0; i < targetDates.length; i += SCAN_CONCURRENCY) {
+    const chunk = targetDates.slice(i, i + SCAN_CONCURRENCY)
+    results.push(...(await Promise.all(chunk.map((d) => scanJrdbRaceDay(d)))))
+  }
   return results.flat().sort((a, b) => (a.raceDate < b.raceDate ? 1 : a.raceDate > b.raceDate ? -1 : a.raceNumber - b.raceNumber))
 }
 
@@ -916,63 +922,143 @@ export type JrdbStatsSummary = {
 
 const JRDB_BET_TYPE_ORDER = ['tansho', 'fukusho', 'umaren', 'wide', 'umatan', 'sanrenpuku', 'sanrentan'] as const
 
-// 全アーカイブスキャン(数千レース)は数秒かかるため、パラメータの組み合わせごとに短時間キャッシュする。
-// ダウンロード済みファイルは基本的に増える一方(週次同期で追記)なので、キャッシュ切れまでの間だけ古くなる程度。
+// 全アーカイブスキャン(10年分・3万件超のレース)は、生ファイルの読み込み+全レース分の買い目計算を
+// 毎回やり直すと非常に重く、Promise.allで全日付を同時に処理するとメモリも急増する
+// (以前はキャッシュ温め処理が3回連続でフルスキャンを実行し、JSヒープ不足でサーバーがクラッシュした)。
+// そこで「日付ごとの券種別集計」という小さい結果だけをディスクに永続化し、新しく追加された日付だけを
+// 差分計算する方式に変更した。券種別の的中率・回収率の集計に必要な数値(試行数・的中数・賭け金・払戻額)
+// さえ残せば十分なので、個々の買い目(picks配列など)は集計した時点で捨てる。
 const BACKTEST_CACHE_TTL_MS = 10 * 60 * 1000
 const backtestCache = new Map<string, { computedAt: number; result: JrdbStatsSummary }>()
+const timeseriesCache = new Map<string, { computedAt: number; result: JrdbStatsPeriodPoint[] }>()
 
-type BacktestRaceEntry = { period: string; confidence: string; actualReturn: JrdbActualReturn }
+type RaceTypeAgg = { attempts: number; hits: number; stake: number; payout: number }
+type RaceAggregateEntry = { period: string; confidence: string; byType: Partial<Record<(typeof JRDB_BET_TYPE_ORDER)[number], RaceTypeAgg>> }
 
-// 結果確定済みレースをスキャンし、券種別集計・期間別集計の両方で使えるフラットなレコード列を返す。
-async function scanConfirmedRacesForBacktest(dates: Date[]): Promise<BacktestRaceEntry[]> {
-  const dayResults = await Promise.all(
-    dates.map(async (date) => {
-      const dateStr8 = toYymmdd(date)
-      const kyiPath = path.join(DATA_DIR, 'Kyi', `KYI${dateStr8}.txt`)
-      let kyiBuf: Buffer
-      try {
-        kyiBuf = await fs.readFile(kyiPath)
-      } catch {
-        return []
-      }
-      const kyiRows = parseKyiBuffer(kyiBuf)
-      const grouped = new Map<string, { venueCode: string; raceNumber: number; horses: KyiRow[] }>()
-      for (const r of kyiRows) {
-        const venueCode = String(r.venueCode)
-        const raceNumber = Number(r.raceNumber)
-        const key = `${venueCode}-${raceNumber}`
-        if (!grouped.has(key)) grouped.set(key, { venueCode, raceNumber, horses: [] })
-        grouped.get(key)!.horses.push(r)
-      }
-      let sedRows: SedRow[] = []
-      try {
-        sedRows = parseSedBuffer(await fs.readFile(path.join(DATA_DIR, 'Sed', `SED${dateStr8}.txt`)))
-      } catch {
-        return [] // 結果未確定の日は集計対象外
-      }
-      let hjcRaces: ReturnType<typeof parseHjcBuffer> = []
-      try {
-        hjcRaces = parseHjcBuffer(await fs.readFile(path.join(DATA_DIR, 'Hjc', `HJC${dateStr8}.txt`)))
-      } catch {
-        // HJC未取得なら単勝・複勝のみで集計(computeJrdbActualReturnがフォールバック)
-      }
+function emptyAgg(): RaceTypeAgg {
+  return { attempts: 0, hits: 0, stake: 0, payout: 0 }
+}
 
-      const period = isoDateOf(date)
-      const out: BacktestRaceEntry[] = []
-      for (const { venueCode, raceNumber, horses } of grouped.values()) {
-        const venueName = VENUE_NAMES[venueCode] ?? venueCode
-        const analysis = analyzeJrdbRace(venueName, raceNumber, horses)
-        if (!analysis?.bets) continue
-        const sedHorses = sedRows.filter((r) => r.venueCode === venueCode && r.raceNumber === raceNumber)
-        if (sedHorses.length === 0) continue
-        const hjcPayouts = hjcRaces.find((r) => r.venueCode === venueCode && r.raceNumber === raceNumber)?.payouts ?? null
-        const actualReturn = computeJrdbActualReturn(analysis.bets, sedHorses, hjcPayouts)
-        out.push({ period, confidence: analysis.confidenceLabel, actualReturn })
+const ANALYSIS_CACHE_PATH = path.join(DATA_DIR, '..', 'jrdb-analysis-cache.json')
+const SCAN_CONCURRENCY = 16 // 同時に開くファイル数を抑え、メモリ・ファイルハンドルの急増を防ぐ
+
+let sharedEntries: RaceAggregateEntry[] | null = null
+let buildPromise: Promise<RaceAggregateEntry[]> | null = null
+
+// 1日ぶんのKYI/SED/HJCを読み、その日の全レースを券種別カウンタに集計する(生の買い目配列は保持しない)。
+async function scanOneDateAggregated(date: Date): Promise<RaceAggregateEntry[]> {
+  const dateStr8 = toYymmdd(date)
+  const kyiPath = path.join(DATA_DIR, 'Kyi', `KYI${dateStr8}.txt`)
+  let kyiBuf: Buffer
+  try {
+    kyiBuf = await fs.readFile(kyiPath)
+  } catch {
+    return []
+  }
+  const kyiRows = parseKyiBuffer(kyiBuf)
+  const grouped = new Map<string, { venueCode: string; raceNumber: number; horses: KyiRow[] }>()
+  for (const r of kyiRows) {
+    const venueCode = String(r.venueCode)
+    const raceNumber = Number(r.raceNumber)
+    const key = `${venueCode}-${raceNumber}`
+    if (!grouped.has(key)) grouped.set(key, { venueCode, raceNumber, horses: [] })
+    grouped.get(key)!.horses.push(r)
+  }
+  let sedRows: SedRow[] = []
+  try {
+    sedRows = parseSedBuffer(await fs.readFile(path.join(DATA_DIR, 'Sed', `SED${dateStr8}.txt`)))
+  } catch {
+    return [] // 結果未確定の日は集計対象外
+  }
+  let hjcRaces: ReturnType<typeof parseHjcBuffer> = []
+  try {
+    hjcRaces = parseHjcBuffer(await fs.readFile(path.join(DATA_DIR, 'Hjc', `HJC${dateStr8}.txt`)))
+  } catch {
+    // HJC未取得なら単勝・複勝のみで集計(computeJrdbActualReturnがフォールバック)
+  }
+
+  const period = isoDateOf(date)
+  const out: RaceAggregateEntry[] = []
+  for (const { venueCode, raceNumber, horses } of grouped.values()) {
+    const venueName = VENUE_NAMES[venueCode] ?? venueCode
+    const analysis = analyzeJrdbRace(venueName, raceNumber, horses)
+    if (!analysis?.bets) continue
+    const sedHorses = sedRows.filter((r) => r.venueCode === venueCode && r.raceNumber === raceNumber)
+    if (sedHorses.length === 0) continue
+    const hjcPayouts = hjcRaces.find((r) => r.venueCode === venueCode && r.raceNumber === raceNumber)?.payouts ?? null
+    const actualReturn = computeJrdbActualReturn(analysis.bets, sedHorses, hjcPayouts)
+
+    const byType: RaceAggregateEntry['byType'] = {}
+    for (const type of JRDB_BET_TYPE_ORDER) {
+      const bets = actualReturn[type]
+      if (bets.length === 0) continue
+      const agg = emptyAgg()
+      for (const b of bets) {
+        agg.attempts += 1
+        if (b.hit) agg.hits += 1
+        agg.stake += b.stakeYen
+        agg.payout += b.payoutYen
       }
-      return out
-    }),
-  )
-  return dayResults.flat()
+      byType[type] = agg
+    }
+    out.push({ period, confidence: analysis.confidenceLabel, byType })
+  }
+  return out
+}
+
+// 日付リストを小分けのバッチで処理し、ピークメモリを抑える(全件Promise.allは避ける)。
+async function scanDatesAggregated(dates: Date[]): Promise<RaceAggregateEntry[]> {
+  const out: RaceAggregateEntry[] = []
+  for (let i = 0; i < dates.length; i += SCAN_CONCURRENCY) {
+    const chunk = dates.slice(i, i + SCAN_CONCURRENCY)
+    const results = await Promise.all(chunk.map(scanOneDateAggregated))
+    for (const r of results) out.push(...r)
+  }
+  return out
+}
+
+// 永続化キャッシュ(ディスク)を読み込み、まだ集計していない日付だけを差分計算して追記する。
+// サーバー再起動をまたいでも、新規ダウンロード分の日付だけを計算すれば済むようになる。
+// 複数箇所から同時に呼ばれても二重にスキャンしないよう、進行中のビルドをin-flightで共有する。
+async function ensureAnalysisCache(): Promise<RaceAggregateEntry[]> {
+  if (sharedEntries) return sharedEntries
+  if (buildPromise) return buildPromise
+
+  buildPromise = (async () => {
+    let entries: RaceAggregateEntry[] = []
+    try {
+      entries = JSON.parse(await fs.readFile(ANALYSIS_CACHE_PATH, 'utf-8'))
+    } catch {
+      entries = []
+    }
+    const covered = new Set(entries.map((e) => e.period))
+
+    const dates = await listAvailableKyiDates()
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const confirmedDates = dates.filter((d) => d < today) // 未確定の未来レースは集計対象外
+    const missingDates = confirmedDates.filter((d) => !covered.has(isoDateOf(d)))
+
+    if (missingDates.length > 0) {
+      console.log(`[jrdb-cache] ${missingDates.length}日分を新たに集計します...`)
+      const newEntries = await scanDatesAggregated(missingDates)
+      entries = [...entries, ...newEntries]
+      try {
+        await fs.writeFile(ANALYSIS_CACHE_PATH, JSON.stringify(entries))
+      } catch (err) {
+        console.error('[jrdb-cache] 永続化に失敗しました(次回起動時に再計算されます):', err)
+      }
+    }
+
+    sharedEntries = entries
+    return entries
+  })()
+
+  try {
+    return await buildPromise
+  } finally {
+    buildPromise = null
+  }
 }
 
 // アーカイブ全体(または期間・確信度で絞り込み)を実際に回した場合の券種別的中率・回収率を集計する。
@@ -986,32 +1072,28 @@ export async function computeJrdbBacktestStats(options?: {
     return cached.result
   }
 
-  const dates = await listAvailableKyiDates()
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  let targetDates = dates.filter((d) => d < today) // 未確定の未来レースは集計対象外
+  let entries = await ensureAnalysisCache()
   if (options?.daysBack) {
-    const cutoff = new Date(today)
+    const cutoff = new Date()
+    cutoff.setHours(0, 0, 0, 0)
     cutoff.setDate(cutoff.getDate() - options.daysBack)
-    targetDates = targetDates.filter((d) => d >= cutoff)
+    const cutoffIso = isoDateOf(cutoff)
+    entries = entries.filter((e) => e.period >= cutoffIso)
   }
-
-  let races = await scanConfirmedRacesForBacktest(targetDates)
   if (options?.confidenceFilter && options.confidenceFilter.length > 0) {
-    races = races.filter((r) => options.confidenceFilter!.includes(r.confidence))
+    entries = entries.filter((e) => options.confidenceFilter!.includes(e.confidence))
   }
 
-  const agg = new Map<string, { attempts: number; hits: number; stake: number; payout: number }>()
-  for (const { actualReturn } of races) {
+  const agg = new Map<string, RaceTypeAgg>()
+  for (const entry of entries) {
     for (const type of JRDB_BET_TYPE_ORDER) {
-      const bets = actualReturn[type]
-      const cur = agg.get(type) ?? { attempts: 0, hits: 0, stake: 0, payout: 0 }
-      for (const b of bets) {
-        cur.attempts += 1
-        if (b.hit) cur.hits += 1
-        cur.stake += b.stakeYen
-        cur.payout += b.payoutYen
-      }
+      const t = entry.byType[type]
+      if (!t) continue
+      const cur = agg.get(type) ?? emptyAgg()
+      cur.attempts += t.attempts
+      cur.hits += t.hits
+      cur.stake += t.stake
+      cur.payout += t.payout
       agg.set(type, cur)
     }
   }
@@ -1033,7 +1115,7 @@ export async function computeJrdbBacktestStats(options?: {
   const totalPayout = byType.reduce((s, t) => s + t.totalPayout, 0)
 
   const result: JrdbStatsSummary = {
-    raceCount: races.length,
+    raceCount: entries.length,
     totalStakeYen,
     totalPayout,
     netYen: totalPayout - totalStakeYen,
@@ -1054,8 +1136,6 @@ export type JrdbStatsPeriodPoint = {
   cumulativeReturnRate: number // 集計開始からの累積金額回収率(%)
 }
 
-const timeseriesCache = new Map<string, { computedAt: number; result: JrdbStatsPeriodPoint[] }>()
-
 // ダッシュボードの回収率推移グラフ用。JRDBアーカイブ全体を日別/月別に集計し、累積回収率も算出する。
 export async function computeJrdbBacktestTimeseries(
   granularity: 'day' | 'month',
@@ -1067,27 +1147,22 @@ export async function computeJrdbBacktestTimeseries(
     return cached.result
   }
 
-  const dates = await listAvailableKyiDates()
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const targetDates = dates.filter((d) => d < today)
-
-  let races = await scanConfirmedRacesForBacktest(targetDates)
+  let entries = await ensureAnalysisCache()
   if (confidenceFilter && confidenceFilter.length > 0) {
-    races = races.filter((r) => confidenceFilter.includes(r.confidence))
+    entries = entries.filter((e) => confidenceFilter.includes(e.confidence))
   }
 
-  const bucket = new Map<string, { attempts: number; hits: number; stake: number; payout: number }>()
-  for (const { period, actualReturn } of races) {
-    const key = granularity === 'month' ? period.slice(0, 7) : period
-    const cur = bucket.get(key) ?? { attempts: 0, hits: 0, stake: 0, payout: 0 }
+  const bucket = new Map<string, RaceTypeAgg>()
+  for (const entry of entries) {
+    const key = granularity === 'month' ? entry.period.slice(0, 7) : entry.period
+    const cur = bucket.get(key) ?? emptyAgg()
     for (const type of JRDB_BET_TYPE_ORDER) {
-      for (const b of actualReturn[type]) {
-        cur.attempts += 1
-        if (b.hit) cur.hits += 1
-        cur.stake += b.stakeYen
-        cur.payout += b.payoutYen
-      }
+      const t = entry.byType[type]
+      if (!t) continue
+      cur.attempts += t.attempts
+      cur.hits += t.hits
+      cur.stake += t.stake
+      cur.payout += t.payout
     }
     bucket.set(key, cur)
   }
@@ -1132,14 +1207,20 @@ export async function searchJrdbRaces(options?: {
 }
 
 // 新しいデータをダウンロードした後など、集計結果が古くなった際にキャッシュを破棄する。
+// ディスク上の永続キャッシュ(jrdb-analysis-cache.json)自体は消さない — 次回ensureAnalysisCache()が
+// 呼ばれた時に新規追加された日付だけを差分計算するので、既存分を再計算する必要はない。
 export function invalidateJrdbCaches(): void {
   backtestCache.clear()
   timeseriesCache.clear()
+  sharedEntries = null
 }
 
-// 全アーカイブスキャンは数秒〜十数秒かかるため、ダッシュボードでよく使う(フィルタ無しの)組み合わせを
-// あらかじめバックグラウンドで計算してキャッシュに温めておく。サーバー起動時・同期完了後に呼ぶ想定。
+// ダッシュボードでよく使う(フィルタ無しの)組み合わせをあらかじめ計算してキャッシュに温めておく。
+// サーバー起動時・同期完了後に呼ぶ想定。ensureAnalysisCache()を先に済ませてから各集計を行うことで、
+// 重い全アーカイブスキャン(ファイル読込+買い目計算)が1回だけで済むようにしている
+// (以前は3つの集計がそれぞれ独立にフルスキャンし、3重に実行されてJSヒープ不足でクラッシュしていた)。
 export async function warmJrdbCaches(): Promise<void> {
+  await ensureAnalysisCache()
   await Promise.all([
     computeJrdbBacktestStats(),
     computeJrdbBacktestTimeseries('day'),

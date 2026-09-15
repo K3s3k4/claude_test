@@ -382,7 +382,9 @@ app.get('/api/jrdb/stats/timeseries', async (req, res) => {
 
 // 予測履歴ページ用: 期間・確信度で絞り込んだ検索可能なレース一覧(デフォルト直近3週間)
 app.get('/api/jrdb/races/search', async (req, res) => {
-  const daysBack = req.query.daysBack != null ? Number(req.query.daysBack) : undefined
+  const rawDaysBack = req.query.daysBack != null ? Number(req.query.daysBack) : undefined
+  // 10年分アーカイブを一度に全件スキャンさせないための安全上限(730日=約2年分)
+  const daysBack = rawDaysBack != null && Number.isFinite(rawDaysBack) ? Math.min(Math.max(rawDaysBack, 1), 730) : undefined
   const confidenceFilter = parseConfidenceFilter(req.query.confidence)
   const venueName = typeof req.query.venue === 'string' ? req.query.venue : undefined
   const races = await searchJrdbRaces({ daysBack, confidenceFilter, venueName })
