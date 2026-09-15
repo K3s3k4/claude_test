@@ -1,3 +1,4 @@
+import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import {
@@ -23,6 +24,24 @@ import {
   getStatsByPeriod,
   getRaceDetail,
 } from './db'
+import {
+  getKyiRace,
+  listKyiRaces,
+  analyzeJrdbRace,
+  getSedRace,
+  getHjcRace,
+  getJrdbRaceMeta,
+  computeJrdbActualReturn,
+  getJrdbRecentPicks,
+  computeJrdbBacktestStats,
+  computeJrdbBacktestTimeseries,
+  searchJrdbRaces,
+  invalidateJrdbCaches,
+  warmJrdbCaches,
+} from './jrdbParser'
+import { syncJrdbData, type JrdbSyncProgress } from './jrdb'
+import fs from 'node:fs'
+import path from 'node:path'
 
 const app = express()
 app.use(cors())
@@ -139,15 +158,26 @@ app.get('/api/history/:raceId', (req, res) => {
   res.json({ detail })
 })
 
-// 券種別の的中率・回収率(100円/点換算)
-app.get('/api/stats', (_req, res) => {
-  res.json({ stats: getStats() })
+function parseConfidenceFilter(raw: unknown): string[] | undefined {
+  if (typeof raw !== 'string' || raw.length === 0) return undefined
+  return raw.split(',').filter(Boolean)
+}
+
+// 券種別の的中率・回収率(予算配分ベースの金額回収率)。
+// granularity+periodで期間を、confidence(カンマ区切り、例: 堅い,やや堅い)で予想時の確信度を絞り込める。
+app.get('/api/stats', (req, res) => {
+  const granularity = req.query.granularity === 'month' ? 'month' : req.query.granularity === 'day' ? 'day' : null
+  const period = typeof req.query.period === 'string' ? req.query.period : null
+  const confidenceFilter = parseConfidenceFilter(req.query.confidence)
+  const summary = granularity && period ? getStats({ granularity, period }, confidenceFilter) : getStats(undefined, confidenceFilter)
+  res.json({ summary })
 })
 
-// ダッシュボードの回収率推移グラフ用(日別/月別)
+// ダッシュボードの回収率推移グラフ用(日別/月別)。confidenceで予想時の確信度を絞り込める。
 app.get('/api/stats/timeseries', (req, res) => {
   const granularity = req.query.granularity === 'month' ? 'month' : 'day'
-  res.json({ points: getStatsByPeriod(granularity) })
+  const confidenceFilter = parseConfidenceFilter(req.query.confidence)
+  res.json({ points: getStatsByPeriod(granularity, confidenceFilter) })
 })
 
 // ダッシュボード表示用: 直近N件の予想レースの自信がある買い目
@@ -290,6 +320,151 @@ app.get('/api/backfill/:jobId', (req, res) => {
   }
   res.json(job)
 })
+
+// 指定日にダウンロード済みのJRDBデータに含まれる開催場・レース番号の一覧
+app.get('/api/jrdb/races', async (req, res) => {
+  const dateStr = typeof req.query.date === 'string' ? req.query.date : null
+  if (!dateStr) {
+    res.status(400).json({ error: 'date(YYYY-MM-DD)を指定してください' })
+    return
+  }
+  const races = await listKyiRaces(new Date(`${dateStr}T00:00:00`))
+  res.json({ races })
+})
+
+// 日付・競馬場・レース番号を指定してJRDBの出走馬データ(指数つき)を取得
+app.get('/api/jrdb/race', async (req, res) => {
+  const dateStr = typeof req.query.date === 'string' ? req.query.date : null
+  const venue = typeof req.query.venue === 'string' ? req.query.venue : null
+  const raceNumber = Number(req.query.raceNumber)
+  if (!dateStr || !venue || !raceNumber) {
+    res.status(400).json({ error: 'date, venue, raceNumber を指定してください' })
+    return
+  }
+  const race = await getKyiRace(new Date(`${dateStr}T00:00:00`), venue, raceNumber)
+  if (!race) {
+    res.status(404).json({ error: 'データが見つかりません(未ダウンロードの可能性があります)' })
+    return
+  }
+  const analysis = analyzeJrdbRace(race.venueName, race.raceNumber, race.horses)
+
+  const date = new Date(`${dateStr}T00:00:00`)
+  const sed = await getSedRace(date, venue, raceNumber)
+  const meta = sed ? getJrdbRaceMeta(sed.horses) : { raceName: null, gradeLabel: null, headCount: null }
+  const hjc = await getHjcRace(date, venue, raceNumber)
+  const actualReturn = sed && analysis?.bets ? computeJrdbActualReturn(analysis.bets, sed.horses, hjc) : null
+
+  res.json({ race, analysis, meta, result: sed ? { finishOrder: sed.horses, actualReturn } : null })
+})
+
+// ダッシュボード表示用: JRDBデータから確度上位N件のレースを買い目つきで返す
+app.get('/api/jrdb/recent-picks', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 4, 20)
+  const picks = await getJrdbRecentPicks(limit)
+  res.json({ picks })
+})
+
+// JRDBアーカイブ全体(または期間・確信度で絞り込み)を回した場合の券種別的中率・回収率
+app.get('/api/jrdb/stats', async (req, res) => {
+  const daysBack = req.query.daysBack != null ? Number(req.query.daysBack) : undefined
+  const confidenceFilter = parseConfidenceFilter(req.query.confidence)
+  const summary = await computeJrdbBacktestStats({ daysBack, confidenceFilter })
+  res.json({ summary })
+})
+
+// ダッシュボードの回収率推移グラフ用(日別/月別)。JRDBアーカイブ全体をもとに算出する。
+app.get('/api/jrdb/stats/timeseries', async (req, res) => {
+  const granularity = req.query.granularity === 'month' ? 'month' : 'day'
+  const confidenceFilter = parseConfidenceFilter(req.query.confidence)
+  const points = await computeJrdbBacktestTimeseries(granularity, confidenceFilter)
+  res.json({ points })
+})
+
+// 予測履歴ページ用: 期間・確信度で絞り込んだ検索可能なレース一覧(デフォルト直近3週間)
+app.get('/api/jrdb/races/search', async (req, res) => {
+  const daysBack = req.query.daysBack != null ? Number(req.query.daysBack) : undefined
+  const confidenceFilter = parseConfidenceFilter(req.query.confidence)
+  const venueName = typeof req.query.venue === 'string' ? req.query.venue : undefined
+  const races = await searchJrdbRaces({ daysBack, confidenceFilter, venueName })
+  res.json({ races })
+})
+
+// --- JRDBデータの同期(未取得分の取得) ---
+
+const jrdbSyncJobs = new Map<string, JrdbSyncProgress>()
+
+app.post('/api/jrdb/sync', (_req, res) => {
+  const jobId = crypto.randomUUID()
+  const job: JrdbSyncProgress = { status: 'running', totalChecks: 0, checked: 0, downloaded: 0, skippedNoData: 0, failed: 0 }
+  jrdbSyncJobs.set(jobId, job)
+  res.json({ jobId })
+
+  syncJrdbData((p) => Object.assign(job, p))
+    .then(async (result) => {
+      markJrdbSynced()
+      if (result.downloaded > 0) {
+        invalidateJrdbCaches()
+        await warmJrdbCaches()
+      }
+    })
+    .catch((err) => {
+      job.status = 'error'
+      job.error = err instanceof Error ? err.message : 'unknown error'
+    })
+})
+
+app.get('/api/jrdb/sync/:jobId', (req, res) => {
+  const job = jrdbSyncJobs.get(req.params.jobId)
+  if (!job) {
+    res.status(404).json({ error: 'ジョブが見つかりません' })
+    return
+  }
+  res.json(job)
+})
+
+// 週次自動同期。サーバー起動中(=このプロセスが生きている間)、最後の同期から7日以上経っていれば自動で実行する。
+const LAST_SYNC_FILE = path.join(import.meta.dirname, '..', 'data', 'jrdb', '.last-sync')
+const AUTO_SYNC_INTERVAL_DAYS = 7
+const AUTO_SYNC_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000 // 1日おきにチェック(実行自体は7日に1回程度)
+
+function markJrdbSynced() {
+  fs.mkdirSync(path.dirname(LAST_SYNC_FILE), { recursive: true })
+  fs.writeFileSync(LAST_SYNC_FILE, new Date().toISOString())
+}
+
+function shouldAutoSyncJrdb(): boolean {
+  try {
+    const last = new Date(fs.readFileSync(LAST_SYNC_FILE, 'utf-8').trim())
+    return (Date.now() - last.getTime()) / (1000 * 60 * 60 * 24) >= AUTO_SYNC_INTERVAL_DAYS
+  } catch {
+    return true // 記録が無ければ初回として実行
+  }
+}
+
+async function runAutoJrdbSyncIfNeeded() {
+  if (!shouldAutoSyncJrdb()) return
+  console.log('[jrdb-sync] 週次自動更新を開始します')
+  try {
+    const result = await syncJrdbData()
+    markJrdbSynced()
+    console.log('[jrdb-sync] 完了:', result)
+    if (result.downloaded > 0) {
+      invalidateJrdbCaches()
+      await warmJrdbCaches()
+    }
+  } catch (err) {
+    console.error('[jrdb-sync] 失敗:', err)
+  }
+}
+
+runAutoJrdbSyncIfNeeded()
+setInterval(runAutoJrdbSyncIfNeeded, AUTO_SYNC_CHECK_INTERVAL_MS)
+
+// ダッシュボードの初回表示が遅くならないよう、フィルタ無しの集計結果をあらかじめ計算してキャッシュしておく。
+console.log('[jrdb-cache] キャッシュを温めています...')
+warmJrdbCaches()
+  .then(() => console.log('[jrdb-cache] キャッシュの準備ができました'))
+  .catch((err) => console.error('[jrdb-cache] 失敗:', err))
 
 // '0.0.0.0'を明示し、Tailscale等の他ネットワーク経由(スマホ含む)からもアクセスできるようにする
 app.listen(PORT, '0.0.0.0', () => {
