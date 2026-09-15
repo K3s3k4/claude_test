@@ -371,7 +371,7 @@ function Prediction() {
   return (
     <div className="container py-4">
       <div className="mb-4">
-        <h1 className="h3 fw-bold mb-1">競馬予想</h1>
+        <h1 className="h3 fw-bold mb-1">netkeiba情報取得</h1>
         <p className="text-muted mb-0">
           netkeibaのレースID（またはレースURL）を入力すると、血統・過去実績をもとにスコアリングします。
         </p>
