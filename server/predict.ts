@@ -374,7 +374,7 @@ export type BetSuggestions = {
   sanrentan: Combo[] // 三連単(1着軸2-3着流し、確率降順)
 }
 
-function combinationsIdx(n: number, k: number): number[][] {
+export function combinationsIdx(n: number, k: number): number[][] {
   if (k === 0) return [[]]
   if (n < k) return []
   const result: number[][] = []
@@ -393,7 +393,7 @@ function combinationsIdx(n: number, k: number): number[][] {
   return result
 }
 
-function permutationsIdx(candidates: number[], k: number): number[][] {
+export function permutationsIdx(candidates: number[], k: number): number[][] {
   if (k === 0) return [[]]
   const result: number[][] = []
   candidates.forEach((item, i) => {
