@@ -18,6 +18,11 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 
+# 認証情報(JRDBのID/パスワードなど)
+.env
+.env.*
+data/jrdb/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
