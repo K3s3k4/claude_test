@@ -292,7 +292,7 @@ export function getHistory() {
     .all()
 }
 
-export type RecentPickCombo = { umabanCombo: string; names: string; probability: number }
+export type RecentPickCombo = { umabanCombo: string; names: string; probability: number; stakeYen: number }
 export type AxisAnalysis = {
   umaban: number
   horseName: string
@@ -371,17 +371,25 @@ export function getRecentPicks(limit = 4): RecentPick[] {
   }
 
   return races.map((r) => {
-    const betsByType: Record<string, RecentPickCombo[]> = {}
+    const grouped: Record<string, { umabanCombo: string; names: string; probability: number }[]> = {}
     for (const b of bets.filter((x) => x.raceId === r.raceId)) {
       const names = b.umabanCombo
         .split(',')
         .map((u) => nameByRaceUmaban.get(`${r.raceId}:${u}`) ?? u)
         .join(' - ')
-      if (!betsByType[b.betType]) betsByType[b.betType] = []
-      betsByType[b.betType].push({ umabanCombo: b.umabanCombo, names, probability: b.probability })
+      if (!grouped[b.betType]) grouped[b.betType] = []
+      grouped[b.betType].push({ umabanCombo: b.umabanCombo, names, probability: b.probability })
     }
-    for (const type of Object.keys(betsByType)) {
-      betsByType[type].sort((a, b) => b.probability - a.probability)
+    const stakesByType = allocateRaceStakes(
+      Object.fromEntries(Object.entries(grouped).map(([t, arr]) => [t, arr.map((c) => ({ probability: c.probability }))])),
+    )
+
+    const betsByType: Record<string, RecentPickCombo[]> = {}
+    for (const [type, arr] of Object.entries(grouped)) {
+      const stakes = stakesByType[type] ?? arr.map(() => 0)
+      betsByType[type] = arr
+        .map((c, i) => ({ ...c, stakeYen: stakes[i] ?? 0 }))
+        .sort((a, b) => b.probability - a.probability)
     }
 
     const axisRow = axisByRace.get(r.raceId)
@@ -529,10 +537,10 @@ export function getRaceDetail(raceId: string): RaceDetail | null {
 function computeConfirmedRaceMoneyStats(budget: number = DEFAULT_BUDGET_YEN) {
   const races = db
     .prepare(
-      `SELECT race_id as raceId, COALESCE(race_date, substr(confirmed_at, 1, 10)) as day
+      `SELECT race_id as raceId, COALESCE(race_date, substr(confirmed_at, 1, 10)) as day, confidence
        FROM races WHERE confirmed_at IS NOT NULL`,
     )
-    .all() as { raceId: string; day: string }[]
+    .all() as { raceId: string; day: string; confidence: string | null }[]
   if (races.length === 0) return []
 
   const raceIds = races.map((r) => r.raceId)
@@ -580,7 +588,7 @@ function computeConfirmedRaceMoneyStats(budget: number = DEFAULT_BUDGET_YEN) {
       })
       byType[t] = { attempts, hits, stake, returnYen }
     }
-    return { raceId: r.raceId, period: r.day, byType }
+    return { raceId: r.raceId, period: r.day, confidence: r.confidence, byType }
   })
 }
 
@@ -594,10 +602,31 @@ export type BetTypeStats = {
   returnRate: number // totalPayout / totalStakeYen * 100(%)。予算配分ベースの金額回収率
 }
 
-export function getStats(): BetTypeStats[] {
+export type StatsSummary = {
+  raceCount: number
+  totalStakeYen: number
+  totalPayout: number
+  netYen: number // totalPayout - totalStakeYen(収支合計)
+  returnRate: number
+  byType: BetTypeStats[]
+}
+
+// periodFilter を渡すと、その日/月に含まれるレースだけに絞って集計する(未指定なら全期間)。
+// confidenceFilter を渡すと、予想時の確信度('堅い'|'やや堅い'|'混戦')がその集合に含まれるレースだけに絞る。
+export function getStats(
+  periodFilter?: { granularity: 'day' | 'month'; period: string },
+  confidenceFilter?: string[],
+): StatsSummary {
   const perRace = computeConfirmedRaceMoneyStats()
+  let races = periodFilter
+    ? perRace.filter((r) => (periodFilter.granularity === 'month' ? r.period.slice(0, 7) : r.period) === periodFilter.period)
+    : perRace
+  if (confidenceFilter && confidenceFilter.length > 0) {
+    races = races.filter((r) => r.confidence != null && confidenceFilter.includes(r.confidence))
+  }
+
   const agg = new Map<string, { attempts: number; hits: number; stake: number; returnYen: number }>()
-  for (const race of perRace) {
+  for (const race of races) {
     for (const [t, v] of Object.entries(race.byType)) {
       const cur = agg.get(t) ?? { attempts: 0, hits: 0, stake: 0, returnYen: 0 }
       cur.attempts += v.attempts
@@ -608,7 +637,7 @@ export function getStats(): BetTypeStats[] {
     }
   }
 
-  return [...agg.entries()].map(([betType, v]) => ({
+  const byType = [...agg.entries()].map(([betType, v]) => ({
     betType,
     attempts: v.attempts,
     hits: v.hits,
@@ -617,6 +646,18 @@ export function getStats(): BetTypeStats[] {
     totalPayout: v.returnYen,
     returnRate: v.stake > 0 ? Math.round((v.returnYen / v.stake) * 1000) / 10 : 0,
   }))
+
+  const totalStakeYen = byType.reduce((s, t) => s + t.totalStakeYen, 0)
+  const totalPayout = byType.reduce((s, t) => s + t.totalPayout, 0)
+
+  return {
+    raceCount: races.length,
+    totalStakeYen,
+    totalPayout,
+    netYen: totalPayout - totalStakeYen,
+    returnRate: totalStakeYen > 0 ? Math.round((totalPayout / totalStakeYen) * 1000) / 10 : 0,
+    byType,
+  }
 }
 
 export type StatsPeriodPoint = {
@@ -631,8 +672,13 @@ export type StatsPeriodPoint = {
 
 // ダッシュボードの回収率推移グラフ用。race_date が無い古いレコードは confirmed_at の日付で代用する。
 // /predict と同じ予算配分ロジックで実際に賭けたであろう金額をもとに回収率を計算する。
-export function getStatsByPeriod(granularity: 'day' | 'month'): StatsPeriodPoint[] {
-  const perRace = computeConfirmedRaceMoneyStats()
+// confidenceFilter を渡すと、予想時の確信度('堅い'|'やや堅い'|'混戦')がその集合に含まれるレースだけに絞る。
+export function getStatsByPeriod(granularity: 'day' | 'month', confidenceFilter?: string[]): StatsPeriodPoint[] {
+  const perRace0 = computeConfirmedRaceMoneyStats()
+  const perRace =
+    confidenceFilter && confidenceFilter.length > 0
+      ? perRace0.filter((r) => r.confidence != null && confidenceFilter.includes(r.confidence))
+      : perRace0
   const bucket = new Map<string, { attempts: number; hits: number; stake: number; returnYen: number }>()
   for (const race of perRace) {
     const period = granularity === 'month' ? race.period.slice(0, 7) : race.period
