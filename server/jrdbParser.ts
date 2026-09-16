@@ -210,9 +210,17 @@ const UKC_FIELDS: FieldSpec[] = [
   ['kettoNumber', 1, 8, 'str'],
   ['horseName', 9, 36, 'str'],
   ['sexCode', 45, 1, 'int'], // 1:牡, 2:牝, 3:セン
+  ['coatColorCode', 46, 2, 'int'], // 毛色
+  ['horseSymbolCode', 48, 2, 'int'], // 馬記号(地方馬・外国産馬など)
   ['sireName', 50, 36, 'str'],
   ['damName', 86, 36, 'str'],
   ['damSireName', 122, 36, 'str'],
+  ['birthDate', 158, 8, 'str'], // YYYYMMDD。馬齢(早熟/晩成)の分析に使う
+  ['sireBirthYear', 166, 4, 'int'], // 父馬生年(同名種牡馬の区別にも使える)
+  ['damBirthYear', 170, 4, 'int'],
+  ['damSireBirthYear', 174, 4, 'int'],
+  ['breederName', 220, 40, 'str'], // 生産者
+  ['originName', 260, 8, 'str'], // 産地
   ['sireKeitoCode', 277, 4, 'int'], // 父系統コード(前2桁:大系統, 後2桁:小系統)
   ['damSireKeitoCode', 281, 4, 'int'], // 母父系統コード
 ]
