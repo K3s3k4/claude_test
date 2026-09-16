@@ -28,11 +28,15 @@ function toYymmdd(date: Date): string {
 const num = (v: unknown): number => (typeof v === 'number' ? v : 0)
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 
-// 全UKCから「馬名 -> 父・母・母父」の索引を作る(1999年分まで含む)
-async function buildPedigreeIndex(): Promise<PedigreeIndex> {
+// 全UKCから2種類の索引を1度だけ作る。
+//   byName:  馬名 -> 父・母・母父 (祖先を辿るチェーン用)
+//   byKetto: 血統登録番号 -> 父・母・母父 (出走馬から血統を引く用)
+// 日別にUKCを読み直すとI/Oとメモリを浪費するため、最初にまとめて構築する。
+async function buildPedigreeIndexes(): Promise<{ byName: PedigreeIndex; byKetto: PedigreeIndex }> {
   const dir = path.join(DATA_DIR, 'Ukc')
   const files = (await fs.readdir(dir)).filter((f) => /^UKC\d{6}\.txt$/.test(f))
-  const index: PedigreeIndex = new Map()
+  const byName: PedigreeIndex = new Map()
+  const byKetto: PedigreeIndex = new Map()
   for (const f of files) {
     let rows: UkcRow[]
     try {
@@ -41,12 +45,14 @@ async function buildPedigreeIndex(): Promise<PedigreeIndex> {
       continue
     }
     for (const r of rows) {
+      const ped = { sire: str(r.sireName), dam: str(r.damName), damSire: str(r.damSireName) }
       const name = str(r.horseName)
-      if (!name) continue
-      index.set(name, { sire: str(r.sireName), dam: str(r.damName), damSire: str(r.damSireName) })
+      if (name) byName.set(name, ped)
+      const ketto = str(r.kettoNumber)
+      if (ketto) byKetto.set(ketto, ped)
     }
   }
-  return index
+  return { byName, byKetto }
 }
 
 async function listKyiDates(): Promise<Date[]> {
