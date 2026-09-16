@@ -78,6 +78,44 @@ const KYI_FIELDS: FieldSpec[] = [
   ['agariIndex', 369, 5, 'float1'],
   ['positionIndex', 374, 5, 'float1'],
   ['paceForecast', 379, 1, 'str'], // H/M/S
+
+  // --- 以下、JRDB公式仕様書(kyi_doc.txt)に存在するが未使用だった項目を追加 ---
+  // 状態・変わり身の判断材料
+  ['trainingArrowCode', 155, 1, 'int'], // 調教矢印(上昇/平行/下降)
+  ['stableEvalCode', 156, 1, 'int'], // 厩舎評価
+  ['hoofCode', 164, 2, 'int'], // 蹄コード
+  ['mudAptCode', 166, 1, 'int'], // 重適性(道悪適性)
+  ['blinker', 171, 1, 'str'], // 1:初装着, 2:再装着, 3:ブリンカー
+  ['sexCode', 404, 1, 'int'], // 1:牡, 2:牝, 3:セン
+  ['horseSymbolCode', 447, 2, 'int'], // 馬記号(地方馬・外国産馬など)
+  ['confirmedWeight', 397, 3, 'int'], // 枠確定馬体重
+  ['confirmedWeightDiffRaw', 400, 3, 'str'], // 符号+数字2桁
+  ['cancelFlag', 403, 1, 'int'], // 1:取消
+
+  // 穴馬の発見用(JRDB独自)
+  ['jackpotIndex', 535, 3, 'int'], // 万券指数
+  ['jackpotMark', 538, 1, 'int'], // 万券印
+  ['explosiveRank', 449, 2, 'int'], // 激走順位(レース内)
+  ['explosiveType', 540, 2, 'str'], // 激走タイプ
+
+  // クラス・ローテーション
+  ['demotionFlag', 539, 1, 'int'], // 1:降級, 2:2段階降級, 0:通常
+  ['restReasonCode', 542, 2, 'int'], // 休養理由分類
+  ['runsSinceStabling', 560, 2, 'int'], // 入厩何走目
+  ['daysSinceStabling', 570, 3, 'int'], // 入厩何日前
+  ['pastureRank', 623, 1, 'str'], // 放牧先ランク A-E
+  ['stableRank', 624, 1, 'int'], // 厩舎ランク 1(高)-9(低)
+
+  // 騎手の期待値(JRDB算出)
+  ['jockeyExpectedWinRate', 461, 4, 'float1'],
+  ['jockeyExpectedTop3Rate', 465, 4, 'float1'],
+
+  // レース内での各指数の順位
+  ['lsIndexRank', 451, 2, 'int'],
+  ['tenIndexRank', 453, 2, 'int'],
+  ['paceIndexRank', 455, 2, 'int'],
+  ['agariIndexRank', 457, 2, 'int'],
+  ['positionIndexRank', 459, 2, 'int'],
 ]
 
 function decodeField(buf: Buffer, start1: number, len: number, kind: FieldKind): string | number | null {
