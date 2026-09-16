@@ -232,6 +232,60 @@ export function parseUkcBuffer(buf: Buffer): UkcRow[] {
   return rows
 }
 
+// TYB(直前情報データ)は1レコード128バイト固定長。JRDB公式仕様書(tyb_doc.txt, 第4b版)に準拠。
+// 発走約15分前に作成されるため、KYIの「前日の基準オッズ」と違い、実質的な最終オッズを持つ。
+// 当日でないと分からない馬体重・馬場状態・気配もここに入る。
+const TYB_RECORD_LENGTH = 128
+const TYB_FIELDS: FieldSpec[] = [
+  ['venueCode', 1, 2, 'str'],
+  ['year', 3, 2, 'str'],
+  ['kaiji', 5, 1, 'int'],
+  ['dayHex', 6, 1, 'hex'],
+  ['raceNumber', 7, 2, 'int'],
+  ['umaban', 9, 2, 'int'],
+  ['idm', 11, 5, 'float1'],
+  ['jockeyIndex', 16, 5, 'float1'],
+  ['infoIndex', 21, 5, 'float1'],
+  ['oddsIndex', 26, 5, 'float1'],
+  ['paddockIndex', 31, 5, 'float1'],
+  ['overallIndex', 41, 5, 'float1'],
+  ['equipmentChange', 46, 1, 'int'], // 0:なし 1:変更 2:特注(効果が期待される変更)
+  ['legInfo', 47, 1, 'int'], // 0:平行 1:良化 2:疑問 3:悪化
+  ['cancelFlag', 48, 1, 'int'],
+  ['jockeyCode', 49, 5, 'str'],
+  ['jockeyName', 54, 12, 'str'],
+  ['weightCarriedRaw', 66, 3, 'int'], // 0.1kg単位
+  ['apprenticeClass', 69, 1, 'int'],
+  ['trackConditionCode', 70, 2, 'int'], // 当日の馬場状態
+  ['weatherCode', 72, 1, 'int'],
+  ['finalOdds', 73, 6, 'float1'], // 単勝オッズ(直前情報作成時点)
+  ['finalPlaceOdds', 79, 6, 'float1'], // 複勝オッズ(下側)
+  ['oddsTime', 85, 4, 'int'], // HHMM
+  ['horseWeight', 89, 3, 'int'],
+  ['horseWeightDiffRaw', 92, 3, 'str'], // 符号+数字2桁
+  ['oddsMark', 95, 1, 'str'],
+  ['paddockMark', 96, 1, 'str'],
+  ['finalOverallMark', 97, 1, 'str'],
+  ['bodyCode', 98, 1, 'str'], // 馬体コード
+  ['conditionCode', 99, 1, 'str'], // 気配コード
+  ['startTime', 100, 4, 'int'], // HHMM
+]
+
+export type TybRow = Record<string, string | number | null>
+
+export function parseTybBuffer(buf: Buffer): TybRow[] {
+  const rows: TybRow[] = []
+  for (let offset = 0; offset + TYB_RECORD_LENGTH <= buf.length; offset += TYB_RECORD_LENGTH) {
+    const record = buf.subarray(offset, offset + TYB_RECORD_LENGTH)
+    const row: TybRow = {}
+    for (const [name, start1, len, kind] of TYB_FIELDS) {
+      row[name] = decodeField(record, start1, len, kind)
+    }
+    rows.push(row)
+  }
+  return rows
+}
+
 function toYymmddLocal(date: Date): string {
   const yy = String(date.getFullYear() % 100).padStart(2, '0')
   const mm = String(date.getMonth() + 1).padStart(2, '0')

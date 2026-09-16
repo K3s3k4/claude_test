@@ -18,7 +18,9 @@ export function jitteredSleep(minMs: number, maxMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-export type JrdbFileType = 'Kyi' | 'Sed' | 'Hjc' | 'Ukc'
+// Tyb(直前情報)は発走約15分前のオッズ・馬体重・当日馬場状態を持つ。
+// KYIの基準オッズは前日時点の値なので、市場との乖離を正確に測るにはTybが必要。
+export type JrdbFileType = 'Kyi' | 'Sed' | 'Hjc' | 'Ukc' | 'Tyb'
 
 export function toYymmdd(date: Date): string {
   const yy = String(date.getFullYear() % 100).padStart(2, '0')
