@@ -294,6 +294,53 @@ export function parseTybBuffer(buf: Buffer): TybRow[] {
   return rows
 }
 
+// SKB(成績拡張データ)は1レコード304バイト固定長。JRDB公式仕様書(skb_doc.txt)に準拠。
+// パドック・脚元の詳細な観察情報を持つが、SEDと同じ「結果確定後」の配信である点に注意。
+// レースコメントはレース後の講評なので予想には使えない(使うとリークになる)。
+const SKB_RECORD_LENGTH = 304
+const SKB_FIELDS: FieldSpec[] = [
+  ['venueCode', 1, 2, 'str'],
+  ['year', 3, 2, 'str'],
+  ['kaiji', 5, 1, 'int'],
+  ['dayHex', 6, 1, 'hex'],
+  ['raceNumber', 7, 2, 'int'],
+  ['umaban', 9, 2, 'int'],
+  ['kettoNumber', 11, 8, 'str'],
+  ['raceDate', 19, 8, 'str'], // YYYYMMDD
+  ['specialCodes', 27, 18, 'str'], // 特記コード6個×3桁
+  ['equipmentCodes', 45, 24, 'str'], // 馬具コード8個×3桁
+  ['legCodeTotal', 69, 9, 'str'], // 脚元コード(総合)3個×3桁
+  ['legCodeFrontLeft', 78, 9, 'str'],
+  ['legCodeFrontRight', 87, 9, 'str'],
+  ['legCodeRearLeft', 96, 9, 'str'],
+  ['legCodeRearRight', 105, 9, 'str'],
+  ['paddockComment', 114, 40, 'str'], // レース前の観察
+  ['legComment', 154, 40, 'str'], // レース前の観察
+  ['equipmentComment', 194, 40, 'str'],
+  ['raceComment', 234, 40, 'str'], // レース後の講評。予想には使用不可
+  ['bit', 274, 3, 'int'], // ハミ
+  ['bandage', 277, 3, 'int'], // バンテージ
+  ['horseshoe', 280, 3, 'int'], // 蹄鉄
+  ['hoofCondition', 283, 3, 'int'], // 蹄状態
+  ['soe', 286, 3, 'int'], // ソエ
+  ['bonyGrowth', 289, 3, 'int'], // 骨瘤
+]
+
+export type SkbRow = Record<string, string | number | null>
+
+export function parseSkbBuffer(buf: Buffer): SkbRow[] {
+  const rows: SkbRow[] = []
+  for (let offset = 0; offset + SKB_RECORD_LENGTH <= buf.length; offset += SKB_RECORD_LENGTH) {
+    const record = buf.subarray(offset, offset + SKB_RECORD_LENGTH)
+    const row: SkbRow = {}
+    for (const [name, start1, len, kind] of SKB_FIELDS) {
+      row[name] = decodeField(record, start1, len, kind)
+    }
+    rows.push(row)
+  }
+  return rows
+}
+
 function toYymmddLocal(date: Date): string {
   const yy = String(date.getFullYear() % 100).padStart(2, '0')
   const mm = String(date.getMonth() + 1).padStart(2, '0')

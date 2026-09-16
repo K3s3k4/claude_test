@@ -20,7 +20,9 @@ export function jitteredSleep(minMs: number, maxMs: number): Promise<void> {
 
 // Tyb(直前情報)は発走約15分前のオッズ・馬体重・当日馬場状態を持つ。
 // KYIの基準オッズは前日時点の値なので、市場との乖離を正確に測るにはTybが必要。
-export type JrdbFileType = 'Kyi' | 'Sed' | 'Hjc' | 'Ukc' | 'Tyb'
+// Skb(成績拡張)はSEDと同じ結果確定後の配信。パドック・脚元コメントや特記/馬具コードを含むが、
+// レースコメント(レース後の講評)も混在するため、予想への利用可否は項目ごとに判断が必要。
+export type JrdbFileType = 'Kyi' | 'Sed' | 'Hjc' | 'Ukc' | 'Tyb' | 'Skb'
 
 export function toYymmdd(date: Date): string {
   const yy = String(date.getFullYear() % 100).padStart(2, '0')
