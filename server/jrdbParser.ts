@@ -735,6 +735,15 @@ export function computeJrdbActualReturn(bets: JrdbBetSuggestions, sedHorses: Sed
 
 // --- アーカイブ全体のスキャン(直近の自信がある買い目・検索可能なレース一覧・全期間バックテスト集計で共用) ---
 
+// JRDBのファイル名は西暦下2桁(YYMMDD)のため、そのまま2000を足すと1999年が2099年になってしまう。
+// JRDBのアーカイブは1999年開始なので、90以上は1900年代として扱う。
+// (ファイル名を文字列のままソートすると "UKC99..." が "UKC26..." より後ろに来る問題も、
+//  この関数でDateに変換してから比較することで回避できる)
+export function jrdbFileDate(yy: string, mm: string, dd: string): Date {
+  const year = Number(yy) >= 90 ? 1900 + Number(yy) : 2000 + Number(yy)
+  return new Date(year, Number(mm) - 1, Number(dd))
+}
+
 // data/jrdb/Kyi 配下に存在する日付の一覧(ダウンロード済みの日のみ)を新しい順で返す。
 async function listAvailableKyiDates(): Promise<Date[]> {
   const dir = path.join(DATA_DIR, 'Kyi')
@@ -749,7 +758,7 @@ async function listAvailableKyiDates(): Promise<Date[]> {
     const m = f.match(/^KYI(\d{2})(\d{2})(\d{2})\.txt$/)
     if (!m) continue
     const [, yy, mm, dd] = m
-    dates.push(new Date(2000 + Number(yy), Number(mm) - 1, Number(dd)))
+    dates.push(jrdbFileDate(yy, mm, dd))
   }
   return dates.sort((a, b) => b.getTime() - a.getTime())
 }

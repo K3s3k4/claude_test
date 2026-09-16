@@ -3,8 +3,20 @@
 import 'dotenv/config'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { parseUkcBuffer, type UkcRow } from '../server/jrdbParser'
+import { parseUkcBuffer, jrdbFileDate, type UkcRow } from '../server/jrdbParser'
 import { buildAncestors, detectCrosses, summarizeInbreeding, type PedigreeIndex } from '../server/pedigree'
+
+// UKCは1999年分まで存在するため、ファイル名の文字列ソートでは "UKC99..." が最後に来てしまう。
+// 実日付に変換してから最新日を選ぶ。
+function latestUkcFile(files: string[]): string {
+  return files
+    .map((f) => {
+      const m = f.match(/^UKC(\d{2})(\d{2})(\d{2})\.txt$/)!
+      return { f, date: jrdbFileDate(m[1], m[2], m[3]) }
+    })
+    .sort((a, b) => a.date.getTime() - b.date.getTime())
+    .at(-1)!.f
+}
 
 const DATA_DIR = path.join(import.meta.dirname, '..', 'data', 'jrdb')
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -36,8 +48,9 @@ async function main() {
   console.log(`UKC ${files}ファイルから ${index.size.toLocaleString()}頭の血統索引を構築\n`)
 
   const dir = path.join(DATA_DIR, 'Ukc')
-  const ukcFiles = (await fs.readdir(dir)).filter((f) => /^UKC\d{6}\.txt$/.test(f)).sort()
-  const latest = ukcFiles[ukcFiles.length - 1]
+  const ukcFiles = (await fs.readdir(dir)).filter((f) => /^UKC\d{6}\.txt$/.test(f))
+  const latest = latestUkcFile(ukcFiles)
+  console.log(`対象: ${latest} の出走馬から${SAMPLE}頭\n`)
   const targets = parseUkcBuffer(await fs.readFile(path.join(dir, latest))).slice(0, SAMPLE)
 
   for (const t of targets) {

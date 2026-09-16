@@ -6,7 +6,20 @@
 import 'dotenv/config'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { parseUkcBuffer, type UkcRow } from '../server/jrdbParser'
+import { parseUkcBuffer, jrdbFileDate, type UkcRow } from '../server/jrdbParser'
+import { buildAncestors, summarizeInbreeding } from '../server/pedigree'
+
+// UKCは1999年分まで存在するため、ファイル名の文字列ソートでは "UKC99..." が最後に来てしまう。
+// 実日付に変換してから最新日を選ぶ。
+function latestUkcFile(files: string[]): string {
+  return files
+    .map((f) => {
+      const m = f.match(/^UKC(\d{2})(\d{2})(\d{2})\.txt$/)!
+      return { f, date: jrdbFileDate(m[1], m[2], m[3]) }
+    })
+    .sort((a, b) => a.date.getTime() - b.date.getTime())
+    .at(-1)!.f
+}
 
 const DATA_DIR = path.join(import.meta.dirname, '..', 'data', 'jrdb')
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
@@ -44,8 +57,8 @@ async function main() {
 
   // 直近のUKCファイルに載っている馬(=現役馬)を対象に、何世代まで名前が取れるか測る
   const dir = path.join(DATA_DIR, 'Ukc')
-  const files = (await fs.readdir(dir)).filter((f) => /^UKC\d{6}\.txt$/.test(f)).sort()
-  const latest = files[files.length - 1]
+  const files = (await fs.readdir(dir)).filter((f) => /^UKC\d{6}\.txt$/.test(f))
+  const latest = latestUkcFile(files)
   const targets = parseUkcBuffer(await fs.readFile(path.join(dir, latest)))
   console.log(`対象(最新日 ${latest} の出走馬): ${targets.length}頭\n`)
 
@@ -96,12 +109,49 @@ async function main() {
   console.log('\n【3世代目(曾祖父母8頭)】')
   console.log(`  父父の父が取れた: ${gen3Any}頭 (${pct(gen3Any)})`)
 
+  // --- インブリード(クロス)が実際に何%検出できるか ---
+  console.log('\n【インブリード検出の実現性】')
+  const genKnown = [0, 0, 0, 0, 0, 0] // 各世代で判明した祖先の延べ数
+  const genTheoretical = [0, 2, 4, 8, 16, 32]
+  let withCross = 0
+  let withCloseCross = 0
+  let coefficientSum = 0
+  const crossExamples: string[] = []
+
+  for (const t of targets) {
+    const root = { sire: str(t.sireName), dam: str(t.damName), damSire: str(t.damSireName) }
+    const ancestors = buildAncestors(root, index, 5)
+    for (const a of ancestors) {
+      if (a.generation <= 5) genKnown[a.generation]++
+    }
+    const summary = summarizeInbreeding(ancestors)
+    if (summary.crossCount > 0) {
+      withCross++
+      coefficientSum += summary.coefficient
+      if (summary.topCross && crossExamples.length < 5) {
+        crossExamples.push(`${str(t.horseName)}: ${summary.topCross.ancestor} ${summary.topCross.label}`)
+      }
+    }
+    if (summary.hasCloseCross) withCloseCross++
+  }
+
+  for (let g = 1; g <= 5; g++) {
+    const avg = genKnown[g] / targets.length
+    console.log(`  ${g}世代目: 平均${avg.toFixed(1)}頭判明 / 理論${genTheoretical[g]}頭 (${((avg / genTheoretical[g]) * 100).toFixed(0)}%)`)
+  }
+  console.log(`  クロスが検出できた馬: ${withCross}頭 (${pct(withCross)})`)
+  console.log(`  濃いクロス(3世代以内に2回)を持つ馬: ${withCloseCross}頭 (${pct(withCloseCross)})`)
+  if (withCross > 0) {
+    console.log(`  クロスありの馬の平均近交係数: ${((coefficientSum / withCross) * 100).toFixed(2)}%`)
+    console.log(`  例: ${crossExamples.join(' / ')}`)
+  }
+
   console.log('\n【結論】')
-  if (sireFound / targets.length < 0.2) {
-    console.log('  父馬自身のUKCレコードがほとんど見つからない。')
-    console.log('  理由: UKCは「その日に出走した馬」の集まりであり、種牡馬は既に引退していて')
-    console.log('  現役期間(多くは2016年より前)が我々のアーカイブ範囲外のため。')
-    console.log('  → 自己参照チェーンでは祖父母の個体名はほぼ取れない。')
+  if (withCross / targets.length < 0.15) {
+    console.log('  クロスの検出率が低すぎるため、インブリードを特徴量にした分析は現時点では困難。')
+    console.log('  深い世代の欠損が多く、実際にはクロスしていても検出できていない可能性が高い。')
+  } else {
+    console.log('  クロスが十分な割合で検出できており、インブリードを切り口にした分析が可能。')
   }
 }
 
