@@ -8,17 +8,19 @@ import { downloadJrdbFile, jitteredSleep, JrdbAuthError, type JrdbFileType } fro
 function parseArgs() {
   const args = process.argv.slice(2)
   let days = 1095
+  let start = 1 // 何日前から開始するか(既に取得済みの期間を丸ごと飛ばすために使う)
   let types: JrdbFileType[] = ['Kyi', 'Sed']
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--days') days = Number(args[++i])
+    if (args[i] === '--start') start = Number(args[++i])
     if (args[i] === '--types') types = args[++i].split(',') as JrdbFileType[]
   }
-  return { days, types }
+  return { days, start, types }
 }
 
 async function main() {
-  const { days, types } = parseArgs()
-  console.log(`JRDB一括ダウンロード開始: 過去${days}日分, 種別=${types.join(',')}`)
+  const { days, start, types } = parseArgs()
+  console.log(`JRDB一括ダウンロード開始: ${start}〜${days}日前, 種別=${types.join(',')}`)
 
   const today = new Date()
   let found = 0
@@ -26,7 +28,7 @@ async function main() {
   let failed = 0
   const startedAt = Date.now()
 
-  for (let offset = 1; offset <= days; offset++) {
+  for (let offset = start; offset <= days; offset++) {
     const date = new Date(today)
     date.setDate(date.getDate() - offset)
 
